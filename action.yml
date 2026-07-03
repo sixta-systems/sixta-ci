@@ -37,6 +37,9 @@ inputs:
   manage_py:
     description: "Path to manage.py (relative to working_directory)."
     default: "manage.py"
+  alembic_config:
+    description: "Alembic config for offline SQL render (alembic upgrade --sql). No database needed."
+    default: "alembic.ini"
   working_directory:
     description: "Directory to run the review in (where manage.py lives). Set for a monorepo with the Django app in a subdirectory."
     default: "."
@@ -79,6 +82,7 @@ runs:
         SIXTA_SCHEMA_CMD: ${{ inputs.schema_cmd }}
         SIXTA_URL: ${{ inputs.sixta_url }}
         SIXTA_MANAGE_PY: ${{ inputs.manage_py }}
+        SIXTA_ALEMBIC_CONFIG: ${{ inputs.alembic_config }}
         SIXTA_SARIF: ${{ inputs.sarif }}
       run: |
         curl -fsSL "https://raw.githubusercontent.com/sixta-systems/sixta-ci/${{ inputs.script_ref }}/sixta_review.py" -o "${RUNNER_TEMP}/sixta_review.py"
