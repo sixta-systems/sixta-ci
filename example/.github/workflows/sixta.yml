@@ -1,0 +1,51 @@
+# Demo consumer of the sixta-ci GitHub Action. In a real project with the
+# Django app at the repo root, drop `working_directory` and the `example/`
+# path prefixes. Add SIXTA_API_KEY as a repository secret
+# (Settings -> Secrets and variables -> Actions).
+name: SIXTA SQL review
+
+on:
+  pull_request:
+    paths:
+      - "**/migrations/*.py"
+      - "**/*.sql"
+
+permissions:
+  contents: read
+  pull-requests: write      # post the review as a PR comment
+  security-events: write    # upload SARIF to code scanning
+
+jobs:
+  sixta:
+    runs-on: ubuntu-latest
+    # sqlmigrate needs a live database connection (Django resolves constraint
+    # names through it). An empty database is fine.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: sixta_ci
+          POSTGRES_USER: sixta_ci
+          POSTGRES_PASSWORD: sixta_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      SIXTA_API_KEY: ${{ secrets.SIXTA_API_KEY }}
+      DATABASE_URL: postgres://sixta_ci:sixta_ci@localhost:5432/sixta_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # the review diffs against the PR base commit
+      - uses: sixta-systems/sixta-ci@v1
+        with:
+          engine_version: "16"  # match production — verdicts are version-dependent
+          setup: pip install -r requirements.txt
+          gate: high            # fail the check on High or Critical findings
+          fail_mode: open       # SIXTA unreachable -> warn and pass
+          working_directory: example   # demo app lives here; drop in a real repo
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: example/sixta.sarif

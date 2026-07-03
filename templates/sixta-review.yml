@@ -1,0 +1,105 @@
+# sixta-review — GitLab CI job template (SIXTA Connect SQL review for Django).
+#
+# Hosted on GitHub; consume with `include: remote:` (inputs work with remote
+# includes on GitLab >= 16.6):
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.1.0/templates/sixta-review.yml'
+#       inputs:
+#         engine_version: "16"        # match production!
+#         setup: pip install -r requirements.txt
+#
+# Required CI/CD variables (Settings -> CI/CD -> Variables, masked):
+#   SIXTA_API_KEY     free key from connect.sixta.ai/portal
+#   SIXTA_BOT_TOKEN   optional: project access token (api scope, Reporter+) for MR comments
+#
+# The job needs merge-request pipelines enabled — with branch-only pipelines it
+# never runs. Self-hosted runners need outbound HTTPS to connect.sixta.ai
+# (and raw.githubusercontent.com for the script fetch).
+
+spec:
+  inputs:
+    stage:
+      default: test
+    image:
+      default: "python:3.13"
+      description: Image able to install and run your Django project.
+    setup:
+      default: "pip install -r requirements.txt"
+      description: Command that installs your Django environment (manage.py must run).
+    manage_py:
+      default: "manage.py"
+    engine:
+      default: "postgresql"
+      options: ["postgresql", "mysql"]
+    engine_version:
+      default: ""
+      description: Production engine version, e.g. "16" or "8.0.35". Verdicts are version-dependent — set this.
+    gate:
+      default: "high"
+      options: ["critical", "high", "medium", "low", "none"]
+      description: Fail the job when any finding is at or above this severity.
+    fail_mode:
+      default: "open"
+      options: ["open", "closed"]
+      description: open = SIXTA unreachable -> warn and pass; closed -> fail.
+    allow_failure:
+      type: boolean
+      default: false
+      description: Set true for a soak period before enforcing the gate.
+    api:
+      default: "mcp"
+      options: ["mcp", "v1"]
+      description: v1 batches the whole run into one POST /v1/analyze (server-rendered code-quality, shared schema context).
+    schema_cmd:
+      default: ""
+      description: v1 only — command whose stdout is the shared schema DDL (default pg_dump --schema-only when a DB is configured).
+    sixta_url:
+      default: "https://connect.sixta.ai/mcp"
+    script_ref:
+      default: "v0.1.0"
+      description: Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag.
+    postgres_image:
+      default: "postgres:16"
+      description: Service image for sqlmigrate's required database connection (see README for MySQL).
+
+---
+sixta-review:
+  stage: $[[ inputs.stage ]]
+  image: $[[ inputs.image ]]
+  allow_failure: $[[ inputs.allow_failure ]]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "**/migrations/*.py"
+        - "**/*.sql"
+  services:
+    # sqlmigrate needs a live connection (Django resolves constraint names
+    # through the schema editor). An empty database is fine.
+    - name: $[[ inputs.postgres_image ]]
+      alias: postgres
+  variables:
+    GIT_DEPTH: "0" # full history: the job diffs against the MR base SHA
+    POSTGRES_DB: sixta_ci
+    POSTGRES_USER: sixta_ci
+    POSTGRES_PASSWORD: sixta_ci
+    DATABASE_URL: "postgres://sixta_ci:sixta_ci@postgres:5432/sixta_ci"
+    SIXTA_ENGINE: $[[ inputs.engine ]]
+    SIXTA_ENGINE_VERSION: $[[ inputs.engine_version ]]
+    SIXTA_API: $[[ inputs.api ]]
+    SIXTA_SCHEMA_CMD: $[[ inputs.schema_cmd ]]
+    SIXTA_GATE: $[[ inputs.gate ]]
+    SIXTA_FAIL_MODE: $[[ inputs.fail_mode ]]
+    SIXTA_URL: $[[ inputs.sixta_url ]]
+    SIXTA_MANAGE_PY: $[[ inputs.manage_py ]]
+  script:
+    - $[[ inputs.setup ]]
+    - curl -fsSL "https://raw.githubusercontent.com/sixta-systems/sixta-ci/$[[ inputs.script_ref ]]/sixta_review.py" -o /tmp/sixta_review.py
+    - python /tmp/sixta_review.py
+  artifacts:
+    when: always
+    reports:
+      codequality: gl-code-quality-report.json
+    paths:
+      - sixta-report.md
+    expire_in: 30 days

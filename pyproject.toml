@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sixta-review"
+version = "0.1.0"
+description = "SIXTA Connect SQL review for Django migrations — GitLab CI job + pre-commit hook"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+# Stdlib only at runtime, by design: the CI job curls a single file.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+sixta-review = "sixta_review:main"
+
+[tool.setuptools]
+py-modules = ["sixta_review"]

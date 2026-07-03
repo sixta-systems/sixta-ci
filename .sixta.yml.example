@@ -1,0 +1,16 @@
+# Optional repo-level hints for sixta-review — copy to .sixta.yml in your
+# project root. SIXTA never connects to your database, so it can't know table
+# sizes; these hints turn conditional verdicts ("on a large table, expect
+# minutes of blocked writes") into concrete duration estimates and risk
+# escalation. Plain JSON content is also accepted (or use .sixta.json) if
+# PyYAML isn't installed in the CI job.
+#
+# Table names are the *database* table names (Django default: <app>_<model>).
+tables:
+  shop_order:
+    size_bytes: 12000000000 # ~12 GB
+    has_foreign_keys: true
+    has_triggers: false
+  shop_orderline:
+    size_bytes: 48000000000
+    has_foreign_keys: true

@@ -1,0 +1,4 @@
+tables:
+  shop_order:
+    size_bytes: 12000000000
+    has_foreign_keys: false

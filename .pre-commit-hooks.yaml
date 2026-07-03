@@ -1,0 +1,18 @@
+# pre-commit framework integration (https://pre-commit.com):
+#
+#   repos:
+#     - repo: https://github.com/sixta-systems/sixta-ci
+#       rev: v0.1.0
+#       hooks:
+#         - id: sixta-review
+#
+# Needs SIXTA_API_KEY in the developer's environment and a runnable Django
+# env (sqlmigrate requires a database connection). Findings >= the gate
+# severity block the commit; unset/loosen with SIXTA_GATE=none|critical.
+- id: sixta-review
+  name: SIXTA SQL migration review
+  entry: sixta-review --local
+  language: python
+  files: '(^|/)migrations/.*\.py$|\.sql$'
+  exclude: '(^|/)migrations/__init__\.py$'
+  pass_filenames: true

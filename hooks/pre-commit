@@ -1,0 +1,22 @@
+#!/bin/sh
+# sixta-review as a plain git pre-commit hook (no pre-commit framework).
+# Install: cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# Requires: SIXTA_API_KEY in the environment, a runnable Django env, and a
+# reachable database (sqlmigrate needs a connection). Skip once with
+# `git commit --no-verify` or permanently with SIXTA_SKIP=1.
+
+[ -n "$SIXTA_SKIP" ] && exit 0
+
+if command -v sixta-review >/dev/null 2>&1; then
+  exec sixta-review --local
+fi
+
+# Fall back to the single-file script next to this repo, or fetch a pinned copy.
+SCRIPT="$(dirname "$0")/../../sixta_review.py"
+if [ -f "$SCRIPT" ]; then
+  exec python3 "$SCRIPT" --local
+fi
+
+echo "sixta-review not installed: pip install git+https://github.com/sixta-systems/sixta-ci@v0.1.0" >&2
+exit 1
