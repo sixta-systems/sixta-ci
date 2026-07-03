@@ -416,7 +416,7 @@ def changed_files(base_sha: Optional[str], local: bool, explicit: list[str]) -> 
         if not base_sha:
             die("no diff base: set CI_MERGE_REQUEST_DIFF_BASE_SHA (run in a merge-request pipeline) or pass --base-sha")
         files = _git("diff", "--name-only", "--diff-filter=AM", f"{base_sha}...HEAD")
-    return [f for f in files if migration_target(f) or f.endswith(".sql")]
+    return [f for f in files if is_migration_file(f)]
 
 
 def _git(*args: str) -> list[str]:
@@ -443,6 +443,106 @@ def has_runpython(path: str) -> bool:
             return bool(re.search(r"\bRunPython\b", fh.read()))
     except OSError:
         return False
+
+
+# --------------------------------------------------------------------------
+# Alembic (SQLAlchemy) — offline SQL render (docs/framework-support.md, mechanism A)
+# --------------------------------------------------------------------------
+
+# A revision file under alembic/versions/ or migrations/versions/ (not __init__).
+ALEMBIC_RE = re.compile(r"(?:^|/)(?:alembic|migrations)/versions/(?!__init__)[^/]+\.py$")
+_ALEMBIC_REVISION_RE = re.compile(r"^\s*revision(?::[^=]+)?\s*=\s*['\"]([^'\"]+)['\"]", re.M)
+_ALEMBIC_DOWN_RE = re.compile(r"^\s*down_revision(?::[^=]+)?\s*=\s*(?:['\"]([^'\"]+)['\"]|(None))", re.M)
+# Data-migration smells that don't render to analyzable DDL offline.
+_ALEMBIC_DATA_RE = re.compile(r"\bop\.bulk_insert\s*\(|\bop\.get_bind\s*\(|\bbind\.execute\s*\(", re.I)
+
+
+def alembic_target(path: str) -> bool:
+    return bool(ALEMBIC_RE.search(path.replace(os.sep, "/")))
+
+
+def _alembic_revisions(path: str) -> tuple[str, str]:
+    """(revision, down_revision) from a migration file; down='base' when None.
+    Raises for merge/branched migrations (tuple down_revision) — not supported yet."""
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    rev = _ALEMBIC_REVISION_RE.search(text)
+    if not rev:
+        raise RuntimeError(f"{os.path.basename(path)}: no Alembic 'revision' identifier found")
+    down = _ALEMBIC_DOWN_RE.search(text)
+    if down is None:
+        raise RuntimeError(f"{os.path.basename(path)}: could not parse down_revision (merge/branched migrations aren't supported yet)")
+    return rev.group(1), (down.group(1) or "base")
+
+
+def render_alembic(path: str, opts: argparse.Namespace) -> str:
+    """``alembic upgrade <down>:<rev> --sql`` — offline, no database connection.
+    Renders exactly this revision's SQL, using the project's alembic config for
+    the target dialect."""
+    rev, down = _alembic_revisions(path)
+    config = getattr(opts, "alembic_config", None) or "alembic.ini"
+    proc = subprocess.run(
+        ["alembic", "-c", config, "upgrade", f"{down}:{rev}", "--sql"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"alembic offline render for {os.path.basename(path)} failed:\n{proc.stderr.strip()}")
+    return proc.stdout
+
+
+def alembic_data_ops(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return bool(_ALEMBIC_DATA_RE.search(fh.read()))
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------
+# Framework dispatch — turn a changed file into SQL + an optional review note
+# --------------------------------------------------------------------------
+
+_RUNPYTHON_DESC = ("SIXTA: migration contains RunPython — its effects emit no SQL and were NOT analyzed. "
+                   "Review data-migration logic by hand (long transactions, per-row updates on big tables).")
+_RUNPYTHON_SECTION = "_Contains `RunPython`: not renderable to SQL — flagged for human review._"
+_ALEMBIC_DATA_DESC = ("SIXTA: migration contains data-migration code (op.bulk_insert / get_bind) — it emits no "
+                      "analyzable DDL offline and was NOT analyzed. Review it by hand (long transactions, "
+                      "per-row updates on big tables).")
+_ALEMBIC_DATA_SECTION = "_Contains data-migration code: not renderable to SQL — flagged for human review._"
+
+
+def _manual_review(path: str, description: str, check_name: str, section: str) -> tuple["Finding", str]:
+    return Finding(path=path, severity="Info", description=description, check_name=check_name), section
+
+
+def is_migration_file(path: str) -> bool:
+    """Any file the kit knows how to turn into SQL (used by change discovery)."""
+    return bool(migration_target(path)) or alembic_target(path) or path.endswith(".sql")
+
+
+def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str, Optional[tuple["Finding", str]]]]:
+    """Render a changed file to SQL, dispatching by framework. Returns
+    ``(sql, manual)`` where ``manual`` is an optional (Finding, section) pair for
+    a code data-migration that emits no SQL, or ``None`` to skip the file.
+    Raises RuntimeError if a renderer/read fails (the caller records the skip)."""
+    target = migration_target(path)
+    if target:
+        app, name = target
+        sql = render_migration(opts.manage_py, app, name)
+        manual = _manual_review(path, _RUNPYTHON_DESC, "runpython-manual-review", _RUNPYTHON_SECTION) if has_runpython(path) else None
+        return sql, manual
+    if alembic_target(path):
+        sql = render_alembic(path, opts)
+        manual = _manual_review(path, _ALEMBIC_DATA_DESC, "data-migration-manual-review", _ALEMBIC_DATA_SECTION) if alembic_data_ops(path) else None
+        return sql, manual
+    if path.endswith(".sql"):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read(), None
+        except OSError as exc:
+            raise RuntimeError(f"cannot read {path}: {exc}")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -531,40 +631,23 @@ def _run_tool(client: SixtaClient, tool: str, args: dict, report: FileReport, fa
 def analyze_files(files: list[str], opts: argparse.Namespace, client: SixtaClient, hints: dict) -> list[FileReport]:
     reports: list[FileReport] = []
     for path in files:
-        target = migration_target(path)
-        if target:
-            app, name = target
+        try:
+            extracted = extract_migration(path, opts)
+        except RuntimeError as exc:
             rep = FileReport(path=path)
-            try:
-                sql = render_migration(opts.manage_py, app, name)
-            except RuntimeError as exc:
-                rep.skipped.append(str(exc))
-                warn(str(exc))
-                reports.append(rep)
-                continue
-            rep = analyze_sql(client, path, sql, opts.engine, opts.engine_version, hints, opts.fail_mode)
-            if has_runpython(path):
-                rep.findings.append(
-                    Finding(
-                        path=path,
-                        severity="Info",
-                        description=(
-                            "SIXTA: migration contains RunPython — its effects emit no SQL and were NOT analyzed. "
-                            "Review data-migration logic by hand (long transactions, per-row updates on big tables)."
-                        ),
-                        check_name="runpython-manual-review",
-                    )
-                )
-                rep.sections.append("_Contains `RunPython`: not renderable to SQL — flagged for human review._")
+            rep.skipped.append(str(exc))
+            warn(str(exc))
             reports.append(rep)
-        elif path.endswith(".sql"):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    sql = fh.read()
-            except OSError as exc:
-                warn(f"cannot read {path}: {exc}")
-                continue
-            reports.append(analyze_sql(client, path, sql, opts.engine, opts.engine_version, hints, opts.fail_mode))
+            continue
+        if extracted is None:
+            continue
+        sql, manual = extracted
+        rep = analyze_sql(client, path, sql, opts.engine, opts.engine_version, hints, opts.fail_mode)
+        if manual:
+            finding, section = manual
+            rep.findings.append(finding)
+            rep.sections.append(section)
+        reports.append(rep)
     return reports
 
 
@@ -625,26 +708,15 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
 
     for path in files:
         rep = rep_for(path)
-        target = migration_target(path)
-        runpython = False
-        if target:
-            app, name = target
-            try:
-                sql = render_migration(opts.manage_py, app, name)
-            except RuntimeError as exc:
-                rep.skipped.append(str(exc))
-                warn(str(exc))
-                continue
-            runpython = has_runpython(path)
-        elif path.endswith(".sql"):
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    sql = fh.read()
-            except OSError as exc:
-                warn(f"cannot read {path}: {exc}")
-                continue
-        else:
+        try:
+            extracted = extract_migration(path, opts)
+        except RuntimeError as exc:
+            rep.skipped.append(str(exc))
+            warn(str(exc))
             continue
+        if extracted is None:
+            continue
+        sql, manual = extracted
 
         statements = split_statements(sql)
         ddl = [s for s in statements if classify_statement(s) == "ddl"]
@@ -663,19 +735,10 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
                 kw = _first_keyword(stmt)
                 rep.sections.append(f"_Not analyzed ({kw or 'unrecognized'} statement — outside sixta-review v1 scope)._")
 
-        if runpython:
-            rep.findings.append(
-                Finding(
-                    path=path,
-                    severity="Info",
-                    description=(
-                        "SIXTA: migration contains RunPython — its effects emit no SQL and were NOT analyzed. "
-                        "Review data-migration logic by hand (long transactions, per-row updates on big tables)."
-                    ),
-                    check_name="runpython-manual-review",
-                )
-            )
-            rep.sections.append("_Contains `RunPython`: not renderable to SQL — flagged for human review._")
+        if manual:
+            finding, section = manual
+            rep.findings.append(finding)
+            rep.sections.append(section)
 
     server_renders = None
     if extractions:
@@ -990,6 +1053,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="behavior when SIXTA is unreachable/erroring (findings always gate)")
     p.add_argument("--sixta-url", default=os.environ.get("SIXTA_URL", DEFAULT_SIXTA_URL))
     p.add_argument("--manage-py", default=os.environ.get("SIXTA_MANAGE_PY", "manage.py"))
+    p.add_argument("--alembic-config", default=os.environ.get("SIXTA_ALEMBIC_CONFIG", "alembic.ini"),
+                   help="Alembic config file for offline SQL rendering (alembic upgrade --sql)")
     p.add_argument("--base-sha", default=os.environ.get("CI_MERGE_REQUEST_DIFF_BASE_SHA"))
     p.add_argument("--report-md", default=REPORT_MD)
     p.add_argument("--code-quality", default=CODE_QUALITY_JSON)

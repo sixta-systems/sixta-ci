@@ -1,10 +1,11 @@
 # sixta-ci
 
-**DBRE-grade SQL review for Django migrations and `.sql` files, in your GitLab
-merge requests and GitHub pull requests.**
+**DBRE-grade SQL review for Django and Alembic migrations and `.sql` files, in
+your GitLab merge requests and GitHub pull requests.**
 
 When an MR/PR adds or changes a migration (or a `.sql` file), the CI kit renders
-it to SQL with `manage.py sqlmigrate`, sends DDL to
+it to SQL — Django via `manage.py sqlmigrate`, Alembic via offline
+`alembic upgrade --sql`, and `.sql` files read directly — sends DDL to
 [SIXTA Connect](https://sixta.ai)'s `sixta_analyze_schema_change` and DML to
 `sixta_analyze_query`, and reports back:
 
@@ -92,6 +93,13 @@ it can diff against the PR base.
 **Plain `.sql` migrations (Flyway / Prisma / Liquibase-SQL) need no database and
 no Django.** When only `.sql` files change, the kit reads them directly — skip
 the `postgres` service, `DATABASE_URL`, and the `setup` input entirely.
+
+**Alembic** migrations (`*/versions/*.py`) render **offline** via
+`alembic upgrade <down>:<rev> --sql`, so they need Alembic installed (via `setup`)
+but **no database**. Point at a non-default config with `--alembic-config` /
+`SIXTA_ALEMBIC_CONFIG` (default `alembic.ini`). Data migrations (`op.bulk_insert`,
+`op.get_bind`) don't render offline and are flagged for human review, like
+Django's `RunPython`.
 
 Self-hosted runners need outbound HTTPS to `connect.sixta.ai` and
 `raw.githubusercontent.com`.
