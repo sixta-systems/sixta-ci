@@ -91,6 +91,15 @@ class StubV1Handler(BaseHTTPRequestHandler):
             return self._json(413, {"error": {"code": "payload_too_large", "message": "body too big"}})
 
         resp = _v1_response(request)
+        if StubV1Handler.behavior == "advisory_worst" and resp["results"]:
+            # Server policy: advisory rollback:* findings are visible at their
+            # own severity but excluded from worst_severity (sixta-connect #75).
+            resp["results"][0]["findings"] = [{
+                "rule_id": "rollback:ddl:DROP_TABLE", "title": "rollback: drop table on promo_codes",
+                "severity": "Critical", "source_file": resp["results"][0].get("source_file"),
+            }]
+            resp["results"][0]["overall_severity"] = "Info"
+            resp["worst_severity"] = "Info"
         if StubV1Handler.behavior == "rate_limit" and resp["results"]:
             resp["results"][-1] = {"index": len(resp["results"]) - 1, "kind": resp["results"][-1]["kind"],
                                    "source_file": resp["results"][-1]["source_file"], "rate_limited": True, "retry_after": 3}
@@ -166,7 +175,7 @@ def test_run_v1_batches_ddl_and_dml_in_one_post(stub_v1, tmp_path):
     sql = tmp_path / "changes.sql"
     sql.write_text("CREATE INDEX i ON shop_order (status);\nUPDATE shop_order SET status='n' WHERE status = NULL;\n")
     client = sr.SixtaClient(stub_v1, api_key=None)
-    reports, renders = sr.run_v1([str(sql)], _opts(), client, hints={})
+    reports, renders, _context, _worst = sr.run_v1([str(sql)], _opts(), client, hints={})
 
     # One POST for the whole run; DDL grouped into one migration extraction,
     # DML as its own query extraction.
@@ -202,7 +211,7 @@ def test_run_v1_migration_branch_groups_ddl_and_flags_runpython(stub_v1, monkeyp
     monkeypatch.setattr(sr, "render_migration", lambda mp, app, name: "CREATE INDEX i ON shop_order (status);")
     monkeypatch.setattr(sr, "has_runpython", lambda path: True)
     client = sr.SixtaClient(stub_v1, api_key=None)
-    reports, _ = sr.run_v1(["shop/migrations/0002_x.py"], _opts(), client, hints={})
+    reports, _, _context, _worst = sr.run_v1(["shop/migrations/0002_x.py"], _opts(), client, hints={})
 
     # DDL from the rendered migration + a local RunPython manual-review finding.
     checks = sorted(f.check_name for f in reports[0].findings)
@@ -215,7 +224,7 @@ def test_run_v1_rate_limited_extraction_is_skipped_not_gated(stub_v1, tmp_path):
     sql = tmp_path / "c.sql"
     sql.write_text("UPDATE shop_order SET status='n' WHERE status = NULL;")
     client = sr.SixtaClient(stub_v1, api_key=None)
-    reports, _ = sr.run_v1([str(sql)], _opts(fail_mode="open"), client, hints={})
+    reports, _, _context, _worst = sr.run_v1([str(sql)], _opts(fail_mode="open"), client, hints={})
     assert reports[0].findings == []  # the only extraction was rate limited
     assert any("rate limited" in s for s in reports[0].skipped)
     assert sr.worst_rank(reports) == -1  # does not gate
@@ -233,7 +242,7 @@ def test_run_v1_extraction_error_fail_closed_exits(stub_v1, tmp_path):
 
 def test_run_v1_batch_connectivity_fail_open_skips():
     client = sr.SixtaClient("http://127.0.0.1:1/mcp", api_key=None, timeout=1)
-    reports, renders = sr.run_v1(["x.sql"], _opts(fail_mode="open"), client, hints={})
+    reports, renders, _context, _worst = sr.run_v1(["x.sql"], _opts(fail_mode="open"), client, hints={})
     # x.sql does not exist -> read fails -> no extractions -> no POST, empty batch.
     assert renders is None
 
@@ -270,3 +279,50 @@ def test_main_v1_prefers_server_code_quality(stub_v1, tmp_path, monkeypatch):
     # The server's fingerprint sentinel proves we wrote the server render, not a local rebuild.
     assert entries and entries[0]["fingerprint"] == "b" * 40
     assert (tmp_path / "report.md").read_text().startswith(sr.NOTE_MARKER)
+
+
+def test_main_v1_gates_on_server_worst_severity_not_advisory_findings(stub_v1, tmp_path, monkeypatch):
+    """A Critical rollback:* finding is advisory: the server keeps it out of
+    worst_severity, and the v1 gate must follow the server's verdict."""
+    for var in ("DATABASE_URL", "PGHOST", "PGDATABASE", "SIXTA_BOT_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.chdir(tmp_path)
+    StubV1Handler.behavior = "advisory_worst"
+    sql = tmp_path / "V1__create_promo.sql"
+    sql.write_text("CREATE TABLE promo_codes (id bigint PRIMARY KEY);")
+
+    rc = sr.main([
+        "--api", "v1", "--sixta-url", stub_v1, "--gate", "high",
+        "--report-md", str(tmp_path / "report.md"), "--code-quality", str(tmp_path / "cq.json"),
+        str(sql),
+    ])
+    assert rc == 0  # server worst_severity Info < high, despite the Critical advisory finding
+
+
+def test_v1_sections_quote_the_analyzed_sql(stub_v1, tmp_path):
+    sql = tmp_path / "q.sql"
+    sql.write_text("UPDATE shop_order SET status = NULL WHERE id = 7;")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    reports, _, _, _ = sr.run_v1([str(sql)], _opts(), client, hints={})
+    joined = "\n".join(reports[0].sections)
+    assert "```sql" in joined and "UPDATE shop_order SET status = NULL" in joined
+
+
+def test_v1_no_context_block_invites_connection(stub_v1, tmp_path):
+    sql = tmp_path / "q.sql"
+    sql.write_text("SELECT 1;")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    _, _, context, _ = sr.run_v1([str(sql)], _opts(), client, hints={})
+    assert context == {"source": "none"}
+    md = sr.render_markdown([sr.FileReport(path="q.sql", sections=["r"])], "high", context)
+    assert "connect.sixta.ai/portal/connections" in md
+
+
+def test_render_markdown_reports_context_source():
+    rep = sr.FileReport(path="m.sql", sections=["report"])
+    live = sr.render_markdown([rep], "high", {"source": "live", "captured_at": "2026-07-04T12:00:00Z"})
+    assert "Production context: **live** database snapshot (snapshot 2026-07-04T12:00:00Z)." in live
+    hints = sr.render_markdown([rep], "high", {"source": "hints"})
+    assert "Production context: **declared hints**" in hints
+    free = sr.render_markdown([rep], "high", None)
+    assert "Production context" not in free

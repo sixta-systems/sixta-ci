@@ -17,5 +17,6 @@ def _isolate_ci_env(monkeypatch):
         "GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_STEP_SUMMARY", "GITHUB_API_URL",
         "CI_MERGE_REQUEST_DIFF_BASE_SHA", "CI_API_V4_URL", "CI_PROJECT_ID",
         "CI_MERGE_REQUEST_IID", "SIXTA_BOT_TOKEN", "SIXTA_PLATFORM", "SIXTA_API",
+        "SIXTA_REQUIRE_ROLLBACK",
     ):
         monkeypatch.delenv(var, raising=False)

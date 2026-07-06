@@ -28,6 +28,9 @@ inputs:
   api:
     description: "mcp or v1. Defaults to v1 (one batch POST per run, server-rendered SARIF)."
     default: "v1"
+  require_rollback:
+    description: "v1 only. true raises the no-rollback finding to gate-able severity. Leave false for roll-forward-only policies."
+    default: "false"
   schema_cmd:
     description: "v1 only — command whose stdout is the shared schema DDL (default pg_dump --schema-only when a DB is configured)."
     default: ""
@@ -79,6 +82,7 @@ runs:
         SIXTA_GATE: ${{ inputs.gate }}
         SIXTA_FAIL_MODE: ${{ inputs.fail_mode }}
         SIXTA_API: ${{ inputs.api }}
+        SIXTA_REQUIRE_ROLLBACK: ${{ inputs.require_rollback }}
         SIXTA_SCHEMA_CMD: ${{ inputs.schema_cmd }}
         SIXTA_URL: ${{ inputs.sixta_url }}
         SIXTA_MANAGE_PY: ${{ inputs.manage_py }}

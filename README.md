@@ -129,6 +129,36 @@ every query. **Default: `v1` on GitHub, `mcp` on GitLab** (both overridable).
 names through it), so both wrappers ship a throwaway `postgres:16` service. An
 empty database is fine; for MySQL, override the service and `DATABASE_URL`.
 
+## Rollback audit
+
+In `v1` batch mode the kit also checks whether each changed migration has an
+escape hatch, using the framework's own rollback support (it never invents
+reverse SQL):
+
+- **Django**: renders `manage.py sqlmigrate <app> <migration> --backwards`. A
+  successful reverse render is attached to the request for analysis; Django's
+  `IrreversibleError` is reported as `irreversible`.
+- **Alembic**: a trivially empty `downgrade()` (absent, `pass`, or
+  `raise NotImplementedError`) is reported as `missing`; a real one is rendered
+  offline via `alembic downgrade <rev>:<down> --sql` and attached.
+- **Plain `.sql` / Flyway**: companion undo file check. `V<version>__name.sql`
+  looks for `U<version>__*.sql` in the same directory; a bare `foo.sql` looks
+  for `foo.rollback.sql` or `foo.down.sql`. The companion's contents are
+  attached; no companion means `missing`.
+
+The server analyzes an attached rollback like any other migration (a rollback
+that is itself a lock bomb gets flagged before the incident, not during it) and
+raises a "no rollback prepared" finding when none exists. That finding defaults
+to informational severity because roll-forward-only is a legitimate policy
+(Prisma, for example, ships no down migrations by design), so it never gates by
+default. Set `require_rollback: true` (CLI `--require-rollback`, env
+`SIXTA_REQUIRE_ROLLBACK`) to raise it to gate-able severity.
+
+If a reverse render fails for any other reason, the migration is sent without
+rollback info (unchecked, noted in the job log) and the review continues: the
+audit never fails the run. MCP mode skips the audit entirely, since the MCP
+tools carry no rollback parameter; the rollback audit is `v1` only.
+
 ## Inputs
 
 Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
@@ -140,6 +170,7 @@ Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
 | `fail_mode` | `open` | SIXTA unreachable → `open`: warn & pass; `closed`: fail. Findings always gate. |
 | `api` | `v1` (GitHub) / `mcp` (GitLab) | `v1` batches the whole run into one `POST /v1/analyze`. |
 | `schema_cmd` | — | `v1` only: command whose stdout is the shared schema DDL (default `pg_dump` when a DB is configured). |
+| `require_rollback` | `false` | `v1` only: raise the "no rollback prepared" finding to gate-able severity. See "Rollback audit". |
 | `setup` / `manage_py` | `pip install -r requirements.txt` / `manage.py` | Reuse your test job's environment. Leave `setup` empty for `.sql`-only repos. |
 | `sixta_url` | `https://connect.sixta.ai/mcp` | SIXTA endpoint. |
 

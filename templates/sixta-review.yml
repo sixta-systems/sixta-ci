@@ -54,6 +54,10 @@ spec:
     schema_cmd:
       default: ""
       description: v1 only — command whose stdout is the shared schema DDL (default pg_dump --schema-only when a DB is configured).
+    require_rollback:
+      type: boolean
+      default: false
+      description: v1 only. true raises the no-rollback finding to gate-able severity. Leave false for roll-forward-only policies.
     sixta_url:
       default: "https://connect.sixta.ai/mcp"
     script_ref:
@@ -87,6 +91,7 @@ sixta-review:
     SIXTA_ENGINE: $[[ inputs.engine ]]
     SIXTA_ENGINE_VERSION: $[[ inputs.engine_version ]]
     SIXTA_API: $[[ inputs.api ]]
+    SIXTA_REQUIRE_ROLLBACK: $[[ inputs.require_rollback ]]
     SIXTA_SCHEMA_CMD: $[[ inputs.schema_cmd ]]
     SIXTA_GATE: $[[ inputs.gate ]]
     SIXTA_FAIL_MODE: $[[ inputs.fail_mode ]]

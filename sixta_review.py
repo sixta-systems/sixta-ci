@@ -23,7 +23,10 @@ Wire protocol (two modes, selected by ``--api`` / ``SIXTA_API``):
   file's statements go in a single request with a shared schema context (from
   ``pg_dump`` when available), and the server returns per-extraction verdicts
   plus ready-made GitLab code-quality JSON. Falls back to building code-quality
-  locally when the server does not render it (older ``/v1``).
+  locally when the server does not render it (older ``/v1``). v1 mode also runs
+  the rollback audit: each migration extraction carries the framework's own
+  reverse render (or ``missing``/``irreversible``) for server-side analysis;
+  ``--require-rollback`` makes the no-rollback finding gate-able.
 
 Stdlib only. Python >= 3.9.
 """
@@ -31,6 +34,7 @@ Stdlib only. Python >= 3.9.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -44,7 +48,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 DEFAULT_SIXTA_URL = "https://connect.sixta.ai/mcp"
 REPORT_MD = "sixta-report.md"
@@ -546,6 +550,162 @@ def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str
 
 
 # --------------------------------------------------------------------------
+# Rollback audit (v1 batch mode only) — probe the framework's OWN reverse
+# migration and attach it to the migration extraction. The server analyzes the
+# rendered rollback and raises the "no rollback prepared" finding family; with
+# options.require_rollback it becomes gate-able. Never author reverse SQL here,
+# and never fail the run because a backwards render broke: any unexpected
+# failure leaves the extraction unchecked (no `rollback` field at all).
+# MCP mode skips this entirely — the MCP tools carry no rollback parameter.
+# --------------------------------------------------------------------------
+
+def django_rollback(manage_py: str, app: str, name: str) -> Optional[dict]:
+    """Reverse render via ``manage.py sqlmigrate <app> <name> --backwards``.
+    Success -> ``{"sql": ...}``; Django's IrreversibleError (any nonzero exit
+    mentioning "irreversible") -> ``{"status": "irreversible"}``; anything else
+    -> ``None`` (unchecked, logged)."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, manage_py, "sqlmigrate", app, name, "--backwards"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        info(f"rollback: sqlmigrate {app} {name} --backwards could not run ({exc}) — rollback unchecked")
+        return None
+    if proc.returncode == 0:
+        return {"sql": proc.stdout}
+    if "irreversible" in proc.stderr.lower():
+        return {"status": "irreversible"}
+    info(f"rollback: sqlmigrate {app} {name} --backwards exited {proc.returncode} — rollback unchecked")
+    return None
+
+
+def _alembic_downgrade_missing(path: str) -> bool:
+    """True when the migration has no usable ``downgrade()``: the function is
+    absent, or its body is only ``pass`` / a docstring / ``...`` /
+    ``raise NotImplementedError``. Unparseable files return False (can't tell,
+    so don't claim "missing")."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+    except (OSError, SyntaxError, ValueError):
+        return False
+    func = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "downgrade"),
+        None,
+    )
+    if func is None:
+        return True
+    for stmt in func.body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            continue  # docstring or bare `...`
+        if isinstance(stmt, ast.Raise):
+            exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+            if isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
+                continue
+        return False  # a real statement — the downgrade does something
+    return True
+
+
+def alembic_rollback(path: str, opts: argparse.Namespace) -> Optional[dict]:
+    """Reverse render via offline ``alembic downgrade <rev>:<down> --sql``
+    (mirror of :func:`render_alembic`). A trivially empty ``downgrade()`` body
+    (pass / raise NotImplementedError / absent) -> ``{"status": "missing"}``
+    without rendering (the offline render would still emit alembic_version
+    bookkeeping SQL, so its output can't distinguish an empty downgrade). A
+    real body that renders -> ``{"sql": ...}``; a real body whose render fails
+    or comes back empty -> ``None`` (unchecked, logged)."""
+    try:
+        rev, down = _alembic_revisions(path)
+    except RuntimeError:
+        return None  # merge/unparseable — the forward render already reported it
+    if _alembic_downgrade_missing(path):
+        return {"status": "missing"}
+    config = getattr(opts, "alembic_config", None) or "alembic.ini"
+    try:
+        proc = subprocess.run(
+            ["alembic", "-c", config, "downgrade", f"{rev}:{down}", "--sql"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        info(f"rollback: alembic downgrade render for {os.path.basename(path)} could not run ({exc}) — rollback unchecked")
+        return None
+    if proc.returncode == 0 and proc.stdout.strip():
+        return {"sql": proc.stdout}
+    info(f"rollback: alembic downgrade render for {os.path.basename(path)} failed or rendered nothing — rollback unchecked")
+    return None
+
+
+# Flyway-style versioned migration / undo companion (V2_1__desc.sql / U2_1__*.sql).
+_FLYWAY_VERSIONED_RE = re.compile(r"^V(?P<version>.+?)__.+\.sql$")
+_FLYWAY_UNDO_RE = re.compile(r"^U(?P<version>.+?)__.+\.sql$")
+_ROLLBACK_SQL_SUFFIXES = (".rollback.sql", ".down.sql")
+
+
+def _is_rollback_sql_file(basename: str) -> bool:
+    return bool(_FLYWAY_UNDO_RE.match(basename)) or basename.endswith(_ROLLBACK_SQL_SUFFIXES)
+
+
+def _read_rollback_file(path: str) -> Optional[dict]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return {"sql": fh.read()}
+    except OSError as exc:
+        info(f"rollback: cannot read companion {path} ({exc}) — rollback unchecked")
+        return None
+
+
+def sql_rollback(path: str) -> Optional[dict]:
+    """Companion undo-file check for plain ``.sql`` migrations. Flyway
+    ``V<version>__name.sql`` looks for ``U<version>__*.sql`` in the same
+    directory; a bare ``foo.sql`` looks for ``foo.rollback.sql`` /
+    ``foo.down.sql``. Found -> ``{"sql": <contents>}``; not found ->
+    ``{"status": "missing"}``. Files that ARE rollback artifacts are never
+    checked (``None``)."""
+    base = os.path.basename(path)
+    if _is_rollback_sql_file(base):
+        return None
+    directory = os.path.dirname(path) or "."
+    m = _FLYWAY_VERSIONED_RE.match(base)
+    if m:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            names = []
+        for name in names:
+            um = _FLYWAY_UNDO_RE.match(name)
+            if um and um.group("version") == m.group("version"):
+                return _read_rollback_file(os.path.join(directory, name))
+        return {"status": "missing"}
+    stem = base[: -len(".sql")]
+    for suffix in _ROLLBACK_SQL_SUFFIXES:
+        candidate = os.path.join(directory, stem + suffix)
+        if os.path.exists(candidate):
+            return _read_rollback_file(candidate)
+    return {"status": "missing"}
+
+
+def extract_rollback(path: str, opts: argparse.Namespace) -> Optional[dict]:
+    """Framework dispatch for the rollback probe. Returns the migration
+    extraction's ``rollback`` value or ``None`` to leave it unchecked. Must
+    never raise."""
+    target = migration_target(path)
+    if target:
+        app, name = target
+        return django_rollback(opts.manage_py, app, name)
+    if alembic_target(path):
+        return alembic_rollback(path, opts)
+    if path.endswith(".sql"):
+        return sql_rollback(path)
+    return None
+
+
+# --------------------------------------------------------------------------
 # Analysis orchestration
 # --------------------------------------------------------------------------
 
@@ -693,8 +853,13 @@ def _v1_table_hints(hints: dict) -> dict:
 
 def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hints: dict):
     """Analyze the whole changeset in one /v1/analyze POST. Returns
-    ``(reports, server_renders)`` where server_renders is the response's
-    ``renders`` block (or None), used to prefer server-side code-quality JSON."""
+    ``(reports, server_renders, context, server_worst)`` where server_renders
+    is the response's ``renders`` block (or None), used to prefer server-side
+    code-quality JSON, context is the response's ``context`` block (or None)
+    reporting where the production context came from (Connect Pro), and
+    server_worst is the response's ``worst_severity`` (or None). The server's
+    worst_severity is the authoritative gate input: it deliberately excludes
+    advisory findings (the ``rollback:*`` family informs but does not gate)."""
     reports: dict[str, FileReport] = {}
     order: list[str] = []
     extractions: list[dict] = []
@@ -724,7 +889,11 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         # charge, statements still scored individually server-side); DML is one
         # query extraction per statement. Table hints are applied server-side.
         if ddl:
-            extractions.append({"kind": "migration", "sql": ";\n".join(ddl) + ";", "source_file": path})
+            extraction: dict = {"kind": "migration", "sql": ";\n".join(ddl) + ";", "source_file": path}
+            rollback = extract_rollback(path, opts)
+            if rollback is not None:
+                extraction["rollback"] = rollback
+            extractions.append(extraction)
             ext_owner.append(path)
         for stmt in statements:
             kind = classify_statement(stmt)
@@ -741,9 +910,14 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
             rep.sections.append(section)
 
     server_renders = None
+    context = None
+    server_worst = None
     if extractions:
         render = ["markdown", "sarif"] if getattr(opts, "platform", "gitlab") == "github" else ["markdown", "code-quality"]
-        request: dict = {"engine": opts.engine, "options": {"render": render}, "extractions": extractions}
+        options: dict = {"render": render}
+        if getattr(opts, "require_rollback", False):
+            options["require_rollback"] = True  # absent = false, keeps older servers untouched
+        request: dict = {"engine": opts.engine, "options": options, "extractions": extractions}
         if opts.engine_version:
             request["version"] = opts.engine_version
         schema = capture_schema(opts)
@@ -757,16 +931,22 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
             response = client.analyze_v1(request)
         except SixtaConnectivityError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA unreachable — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None
+            return [reports[p] for p in order], None, None, None
         except SixtaToolError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA error — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None
+            return [reports[p] for p in order], None, None, None
 
-        _apply_v1_results(response, ext_owner, reports, opts)
+        _apply_v1_results(response, ext_owner, reports, opts, extractions)
         renders = response.get("renders")
         server_renders = renders if isinstance(renders, dict) else None
+        ctx = response.get("context")
+        # No context block from the server means no live grounding: surface
+        # that as source "none" so the report can invite setting a connection up.
+        context = ctx if isinstance(ctx, dict) else {"source": "none"}
+        ws = response.get("worst_severity")
+        server_worst = ws if ws in SEVERITY_RANK else None
 
-    return [reports[p] for p in order], server_renders
+    return [reports[p] for p in order], server_renders, context, server_worst
 
 
 def _batch_failed(reports: dict, ext_owner: list, opts: argparse.Namespace, msg: str, exc: Exception) -> None:
@@ -777,7 +957,18 @@ def _batch_failed(reports: dict, ext_owner: list, opts: argparse.Namespace, msg:
         reports[path].skipped.append(msg)
 
 
-def _apply_v1_results(response: dict, ext_owner: list, reports: dict, opts: argparse.Namespace) -> None:
+def _sql_snippet(sql: str, max_lines: int = 8, max_chars: int = 480) -> str:
+    """The analyzed statement, fenced for the report, truncated for sanity."""
+    body = sql.strip()
+    lines = body.splitlines()
+    if len(lines) > max_lines:
+        body = "\n".join(lines[:max_lines]) + "\n-- ... truncated"
+    elif len(body) > max_chars:
+        body = body[:max_chars] + "\n-- ... truncated"
+    return f"```sql\n{body}\n```"
+
+
+def _apply_v1_results(response: dict, ext_owner: list, reports: dict, opts: argparse.Namespace, extractions: Optional[list] = None) -> None:
     for res in response.get("results") or []:
         idx = res.get("index")
         path = ext_owner[idx] if isinstance(idx, int) and 0 <= idx < len(ext_owner) else res.get("source_file")
@@ -797,7 +988,13 @@ def _apply_v1_results(response: dict, ext_owner: list, reports: dict, opts: argp
             rep.skipped.append(f"{kind}: {message} — analysis skipped (fail-open).")
             continue
         if res.get("report_text"):
-            rep.sections.append(res["report_text"])
+            # Anchor the verdict to the exact statement it judged: with several
+            # extractions per file, an unquoted "query analysis" section is
+            # ambiguous (which UPDATE?). The SQL was sent by us, so quoting it
+            # back is payload the reader already owns.
+            sql = (extractions[idx].get("sql") if extractions and isinstance(idx, int) and 0 <= idx < len(extractions) else None)
+            section = f"{_sql_snippet(sql)}\n\n{res['report_text']}" if sql else res["report_text"]
+            rep.sections.append(section)
         for f in res.get("findings") or []:
             rep.findings.append(
                 Finding(
@@ -813,7 +1010,7 @@ def _apply_v1_results(response: dict, ext_owner: list, reports: dict, opts: argp
 # Outputs
 # --------------------------------------------------------------------------
 
-def render_markdown(reports: list[FileReport], gate: str) -> str:
+def render_markdown(reports: list[FileReport], gate: str, context: dict | None = None) -> str:
     lines = [NOTE_MARKER, "## SIXTA SQL review", ""]
     total = sum(len(r.findings) for r in reports)
     worst = worst_rank(reports)
@@ -828,6 +1025,24 @@ def render_markdown(reports: list[FileReport], gate: str) -> str:
         if gate_rank is not None and worst >= gate_rank:
             summary += f" — **gate ({gate}) failed**"
         lines.append(summary + ".")
+    # Connect Pro provenance: present only for entitled orgs; free responses
+    # carry no context block, so this line never appears for them.
+    if context and context.get("source") == "live":
+        captured = context.get("captured_at") or ""
+        suffix = f" (snapshot {captured})" if captured else ""
+        lines.append(f"Production context: **live** database snapshot{suffix}.")
+    elif context and context.get("source") == "hints":
+        lines.append(
+            "Production context: **declared hints**. A live read-only connection grades these verdicts "
+            "against your real table sizes, engine version, and traffic: check or add one at "
+            "connect.sixta.ai/portal/connections."
+        )
+    elif context and context.get("source") == "none":
+        lines.append(
+            "Production context: none. Verdicts use conservative assumptions where table size matters. "
+            "Add a live read-only connection at connect.sixta.ai/portal/connections to grade them "
+            "against your real table sizes, engine version, and traffic."
+        )
     for r in reports:
         lines += ["", f"### `{r.path}`", ""]
         for s in r.sections:
@@ -1036,6 +1251,11 @@ def die(msg: str, code: int = 2) -> None:
     raise SystemExit(code)
 
 
+def _env_flag(name: str) -> bool:
+    """Boolean env parsing for wrapper-forwarded inputs ('false' means false)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sixta-review", description=__doc__.split("\n\n")[0])
     p.add_argument("files", nargs="*", help="explicit files to review (default: git diff discovery)")
@@ -1051,6 +1271,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gate", default=os.environ.get("SIXTA_GATE", "high"), choices=list(GATE_RANK))
     p.add_argument("--fail-mode", default=os.environ.get("SIXTA_FAIL_MODE", "open"), choices=["open", "closed"],
                    help="behavior when SIXTA is unreachable/erroring (findings always gate)")
+    p.add_argument("--require-rollback", action="store_true", default=_env_flag("SIXTA_REQUIRE_ROLLBACK"),
+                   help="v1 only: raise the server's no-rollback finding to gate-able severity "
+                        "(the rollback audit itself always runs in v1 mode)")
     p.add_argument("--sixta-url", default=os.environ.get("SIXTA_URL", DEFAULT_SIXTA_URL))
     p.add_argument("--manage-py", default=os.environ.get("SIXTA_MANAGE_PY", "manage.py"))
     p.add_argument("--alembic-config", default=os.environ.get("SIXTA_ALEMBIC_CONFIG", "alembic.ini"),
@@ -1069,6 +1292,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Resolve the API mode: explicit flag > SIXTA_API env > platform default
     # (GitHub is new, so it defaults to the v1 batch API; GitLab stays mcp).
     opts.api = opts.api or os.environ.get("SIXTA_API") or ("v1" if opts.platform == "github" else "mcp")
+    if opts.require_rollback and opts.api != "v1":
+        warn("--require-rollback has no effect in mcp mode — the rollback audit is /v1 only (set SIXTA_API=v1)")
     if opts.platform == "github" and not opts.base_sha:
         opts.base_sha = github_base_sha()
 
@@ -1090,11 +1315,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     client = SixtaClient(opts.sixta_url, api_key)
     hints = load_table_hints()
     server_renders = None
+    v1_context = None
+    server_worst = None
     if opts.api == "v1":
-        reports, server_renders = run_v1(files, opts, client, hints)
+        reports, server_renders, v1_context, server_worst = run_v1(files, opts, client, hints)
     else:
         reports = analyze_files(files, opts, client, hints)
-    markdown = render_markdown(reports, opts.gate)
+    markdown = render_markdown(reports, opts.gate, v1_context)
 
     if opts.local:
         print(markdown.replace(NOTE_MARKER + "\n", ""))
@@ -1119,10 +1346,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             upsert_mr_note(markdown)
 
     gate_rank = GATE_RANK.get(opts.gate)
-    worst = worst_rank(reports)
+    if server_worst is not None:
+        # v1 mode: the server's worst_severity is the gate input. It already
+        # encodes which findings gate (advisory rollback:* findings, and any
+        # local manual-review flags, inform but do not fail the pipeline).
+        worst = SEVERITY_RANK[server_worst]
+        worst_label = f"server worst_severity {server_worst}"
+    else:
+        worst = worst_rank(reports)
+        worst_name = next((k for k, v in SEVERITY_RANK.items() if v == worst), "Info")
+        worst_label = f"worst finding severity {worst_name}"
     if gate_rank is not None and worst >= gate_rank:
-        worst_name = next(k for k, v in SEVERITY_RANK.items() if v == worst)
-        info(f"gate failed: worst finding severity {worst_name} >= {opts.gate}")
+        info(f"gate failed: {worst_label} >= {opts.gate}")
         return 1
     info("gate passed")
     return 0
