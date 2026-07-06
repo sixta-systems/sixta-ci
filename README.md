@@ -44,6 +44,25 @@ include:
    triggers on `merge_request_event` and never runs in branch-only pipelines.
    (This is the most common "it doesn't run" cause.)
 
+### GitLab CI/CD Catalog
+
+The template is written as a [CI/CD Catalog](docs/gitlab-catalog.md) component.
+Once the project is published to a GitLab-hosted home, the same job is available
+as a versioned, discoverable component:
+
+```yaml
+include:
+  - component: $CI_SERVER_FQDN/sixta-systems/sixta-ci/sixta-review@1.0.0
+    inputs:
+      engine_version: "16"
+      setup: pip install -r requirements.txt
+```
+
+This is functionally identical to the remote-include above (it fetches and runs
+the same `sixta_review.py`). See [docs/gitlab-catalog.md](docs/gitlab-catalog.md)
+for the publish prerequisites (GitLab-hosted project, catalog-resource flag,
+semver release). The remote-include form keeps working regardless.
+
 ## Quick start — GitHub Actions
 
 1. Get a free API key at `connect.sixta.ai/portal` and add it as a repository

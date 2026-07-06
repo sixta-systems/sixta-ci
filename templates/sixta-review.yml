@@ -1,7 +1,23 @@
-# sixta-review — GitLab CI job template (SIXTA Connect SQL review for Django).
+# sixta-review — GitLab CI/CD Catalog component (SIXTA Connect SQL review for
+# Django, Alembic, and plain .sql migrations).
 #
-# Hosted on GitHub; consume with `include: remote:` (inputs work with remote
-# includes on GitLab >= 16.6):
+# This file is a catalog component: the component name is its filename without
+# the extension (`sixta-review`), and the `spec:inputs:` header below declares
+# its inputs. See docs/gitlab-catalog.md for how it is published to the catalog.
+#
+# TWO WAYS TO CONSUME IT (both supported, both functionally identical):
+#
+# 1. Catalog component (from a GitLab-hosted mirror, GitLab >= 17.0 — the
+#    discoverable, versioned form):
+#
+#   include:
+#     - component: $CI_SERVER_FQDN/sixta-systems/sixta-ci/sixta-review@1.0.0
+#       inputs:
+#         engine_version: "16"        # match production!
+#         setup: pip install -r requirements.txt
+#
+# 2. Remote include (from GitHub raw — the form GitLab users rely on today;
+#    inputs work with remote includes on GitLab >= 16.6):
 #
 #   include:
 #     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.3.0/templates/sixta-review.yml'
@@ -18,6 +34,13 @@
 # (and raw.githubusercontent.com for the script fetch).
 
 spec:
+  # Catalog components carry a top-level description; GitLab shows it on the
+  # component's catalog page next to the input table.
+  description: >-
+    DBRE-grade SQL review for Django, Alembic, and plain .sql migrations in
+    GitLab merge requests: lock/blocking analysis, anti-patterns, a Code Quality
+    artifact, an MR comment, and a severity gate. Powered by SIXTA Connect
+    (connect.sixta.ai); SIXTA never connects to your database.
   inputs:
     stage:
       default: test
