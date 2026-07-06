@@ -318,6 +318,22 @@ def test_v1_no_context_block_invites_connection(stub_v1, tmp_path):
     assert "connect.sixta.ai/portal/connections" in md
 
 
+def test_render_markdown_prefers_server_action_links():
+    rep = sr.FileReport(path="m.sql", sections=["report"])
+    add = sr.render_markdown([rep], "high", {
+        "source": "hints", "docs_url": "https://x/docs/ci",
+        "action": {"kind": "add_connection", "url": "https://x/portal/connections"},
+    })
+    assert "https://x/portal/connections" in add and "https://x/docs/ci" in add
+    up = sr.render_markdown([rep], "high", {
+        "source": "none", "docs_url": "https://x/docs/ci",
+        "action": {"kind": "upgrade", "url": "https://x/pricing"},
+    })
+    assert "Connect Pro: https://x/pricing" in up
+    legacy = sr.render_markdown([rep], "high", {"source": "hints"})
+    assert "connect.sixta.ai/portal/connections" in legacy
+
+
 def test_render_markdown_reports_context_source():
     rep = sr.FileReport(path="m.sql", sections=["report"])
     live = sr.render_markdown([rep], "high", {"source": "live", "captured_at": "2026-07-04T12:00:00Z"})

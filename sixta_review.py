@@ -1031,18 +1031,30 @@ def render_markdown(reports: list[FileReport], gate: str, context: dict | None =
         captured = context.get("captured_at") or ""
         suffix = f" (snapshot {captured})" if captured else ""
         lines.append(f"Production context: **live** database snapshot{suffix}.")
-    elif context and context.get("source") == "hints":
-        lines.append(
-            "Production context: **declared hints**. A live read-only connection grades these verdicts "
-            "against your real table sizes, engine version, and traffic: check or add one at "
-            "connect.sixta.ai/portal/connections."
+    elif context and context.get("source") in ("hints", "none"):
+        source = context.get("source")
+        opening = (
+            "Production context: **declared hints**."
+            if source == "hints"
+            else "Production context: none. Verdicts use conservative assumptions where table size matters."
         )
-    elif context and context.get("source") == "none":
-        lines.append(
-            "Production context: none. Verdicts use conservative assumptions where table size matters. "
-            "Add a live read-only connection at connect.sixta.ai/portal/connections to grade them "
-            "against your real table sizes, engine version, and traffic."
-        )
+        # Prefer the server's entitlement-aware links (context.action + docs_url);
+        # fall back to the generic pointer for older servers.
+        action = context.get("action") if isinstance(context.get("action"), dict) else None
+        docs = context.get("docs_url")
+        if action and action.get("kind") == "add_connection" and action.get("url"):
+            cta = f"Add a live read-only connection to grade verdicts against your real table sizes, engine version, and traffic: {action['url']}"
+        elif action and action.get("kind") == "upgrade" and action.get("url"):
+            cta = f"Live-grounded verdicts (real table sizes, engine version, and traffic) are available on Connect Pro: {action['url']}"
+        else:
+            cta = (
+                "A live read-only connection grades verdicts against your real table sizes, engine "
+                "version, and traffic: connect.sixta.ai/portal/connections."
+            )
+        line = f"{opening} {cta}"
+        if docs:
+            line += f" How live context works: {docs}"
+        lines.append(line)
     for r in reports:
         lines += ["", f"### `{r.path}`", ""]
         for s in r.sections:
