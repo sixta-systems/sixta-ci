@@ -57,7 +57,7 @@ inputs:
     default: "3.13"
   script_ref:
     description: "Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag."
-    default: "v0.1.0"
+    default: "v0.3.0"
 
 runs:
   using: "composite"
