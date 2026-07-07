@@ -1,7 +1,7 @@
 # Demo consumer of the sixta-review job template. In a real project this is
 # all you add (plus the SIXTA_API_KEY / SIXTA_BOT_TOKEN CI/CD variables).
 include:
-  - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.3.0/templates/sixta-review.yml"
+  - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.3.1/templates/sixta-review.yml"
     inputs:
       engine_version: "16" # match production
       setup: pip install -r requirements.txt

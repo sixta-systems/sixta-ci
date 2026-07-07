@@ -1,5 +1,5 @@
-name: "SIXTA CI — SQL review"
-description: "DBRE-grade SQL review for Django migrations and .sql files on your pull requests: lock/blocking analysis, anti-patterns, a PR comment, SARIF, and a gate."
+name: "SIXTA CI: SQL review"
+description: "DBRE-grade SQL review for Django and Alembic migrations and .sql files on your pull requests: lock/blocking analysis, anti-patterns, a PR comment, SARIF, and a gate."
 author: "SIXTA"
 branding:
   icon: "database"
@@ -57,7 +57,7 @@ inputs:
     default: "3.13"
   script_ref:
     description: "Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag."
-    default: "v0.3.0"
+    default: "v0.3.1"
 
 runs:
   using: "composite"

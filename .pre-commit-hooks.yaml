@@ -2,7 +2,7 @@
 #
 #   repos:
 #     - repo: https://github.com/sixta-systems/sixta-ci
-#       rev: v0.3.0
+#       rev: v0.3.1
 #       hooks:
 #         - id: sixta-review
 #
