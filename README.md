@@ -34,7 +34,7 @@ database with Connect Pro.
 
 ```yaml
 include:
-  - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.3.2/templates/sixta-review.yml"
+  - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v1/templates/sixta-review.yml"
     inputs:
       engine_version: "16"                      # match production; verdicts are version-dependent
       setup: pip install -r requirements.txt    # whatever makes manage.py runnable
