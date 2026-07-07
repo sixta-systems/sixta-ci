@@ -4,47 +4,49 @@
 your GitLab merge requests and GitHub pull requests.**
 
 When an MR/PR adds or changes a migration (or a `.sql` file), the CI kit renders
-it to SQL — Django via `manage.py sqlmigrate`, Alembic via offline
-`alembic upgrade --sql`, and `.sql` files read directly — sends DDL to
+it to SQL (Django via `manage.py sqlmigrate`, Alembic via offline
+`alembic upgrade --sql`, and `.sql` files read directly), sends DDL to
 [SIXTA Connect](https://sixta.ai)'s `sixta_analyze_schema_change` and DML to
 `sixta_analyze_query`, and reports back:
 
-- **inline diff findings** — a GitLab Code Quality artifact / a GitHub SARIF
+- **inline diff findings**: a GitLab Code Quality artifact or a GitHub SARIF
   code-scanning upload,
 - **a full report as an MR/PR comment** (upserted, never spammy),
-- **a gate** — the job fails when any finding is at or above your threshold,
+- **a gate**: the job fails when any finding is at or above your threshold,
 - the report as a job artifact / step summary.
 
-SIXTA never connects to your database. The rendered SQL of changed migrations is
-sent to `connect.sixta.ai`, analyzed in memory, and never stored
-([data handling](https://connect.sixta.ai/privacy)).
+The CI kit does not connect to your database. It sends the rendered SQL of changed
+migrations to `connect.sixta.ai`, where it is analyzed in memory and your SQL is
+not stored ([data handling](https://connect.sixta.ai/privacy)). To grade against
+your real table sizes, add free `.sixta.yml` hints (below), or connect a read-only
+database with Connect Pro.
 
 > The kit is one stdlib-only Python file (`sixta_review.py`) plus thin platform
 > wrappers. The repo is `sixta-systems/sixta-ci`; the local dev folder may still
 > be named `sixta-review`.
 
-## Quick start — GitLab
+## Quick start: GitLab
 
 1. Get a free API key at `connect.sixta.ai/portal`, store it as a **masked**
    CI/CD variable `SIXTA_API_KEY` (Settings → CI/CD → Variables).
 2. Optional, for MR comments: create a project access token (`api` scope,
    Reporter role) and store it as `SIXTA_BOT_TOKEN`. `CI_JOB_TOKEN` cannot post notes.
-3. Add to `.gitlab-ci.yml` (GitLab ≥ 16.6 — remote includes with inputs):
+3. Add to `.gitlab-ci.yml` (GitLab ≥ 16.6, remote includes with inputs):
 
 ```yaml
 include:
   - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.3.2/templates/sixta-review.yml"
     inputs:
-      engine_version: "16"                      # match production — verdicts are version-dependent
+      engine_version: "16"                      # match production; verdicts are version-dependent
       setup: pip install -r requirements.txt    # whatever makes manage.py runnable
       allow_failure: true                       # soak period; remove to enforce
 ```
 
-4. Make sure **merge request pipelines** are running in your project — the job
+4. Make sure **merge request pipelines** are running in your project. The job
    triggers on `merge_request_event` and never runs in branch-only pipelines.
    (This is the most common "it doesn't run" cause.)
 
-## Quick start — GitHub Actions
+## Quick start: GitHub Actions
 
 1. Get a free API key at `connect.sixta.ai/portal` and add it as a repository
    **secret** `SIXTA_API_KEY` (Settings → Secrets and variables → Actions).
@@ -91,7 +93,7 @@ server-rendered SARIF). A full-history checkout (`fetch-depth: 0`) is required s
 it can diff against the PR base.
 
 **Plain `.sql` migrations (Flyway / Prisma / Liquibase-SQL) need no database and
-no Django.** When only `.sql` files change, the kit reads them directly — skip
+no Django.** When only `.sql` files change, the kit reads them directly, so skip
 the `postgres` service, `DATABASE_URL`, and the `setup` input entirely.
 
 **Alembic** migrations (`*/versions/*.py`) render **offline** via
@@ -112,7 +114,7 @@ MR/PR (migrations changed)
        └─ manage.py sqlmigrate <app> <migration>   → the exact SQL the DB will run
             ├─ DDL  → sixta_analyze_schema_change   (lock, blocking, safe strategy)
             ├─ DML  → sixta_analyze_query           (anti-patterns, correctness bugs)
-            └─ RunPython → flagged for human review (emits no SQL — never passed silently)
+            └─ RunPython → flagged for human review (emits no SQL, never passed silently)
                  └─ code-quality / SARIF + MR/PR comment + exit code
 ```
 
@@ -165,11 +167,11 @@ Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
 
 | Input | Default | Notes |
 |---|---|---|
-| `engine` / `engine_version` | `postgresql` / — | **Set the version to match production.** |
+| `engine` / `engine_version` | `postgresql` / none | **Set the version to match production.** |
 | `gate` | `high` | Fail at ≥ this severity: `critical`, `high`, `medium`, `low`, `none`. |
 | `fail_mode` | `open` | SIXTA unreachable → `open`: warn & pass; `closed`: fail. Findings always gate. |
 | `api` | `v1` (GitHub) / `mcp` (GitLab) | `v1` batches the whole run into one `POST /v1/analyze`. |
-| `schema_cmd` | — | `v1` only: command whose stdout is the shared schema DDL (default `pg_dump` when a DB is configured). |
+| `schema_cmd` | none | `v1` only: command whose stdout is the shared schema DDL (default `pg_dump` when a DB is configured). |
 | `require_rollback` | `false` | `v1` only: raise the "no rollback prepared" finding to gate-able severity. See "Rollback audit". |
 | `setup` / `manage_py` | `pip install -r requirements.txt` / `manage.py` | Reuse your test job's environment. Leave `setup` empty for `.sql`-only repos. |
 | `sixta_url` | `https://connect.sixta.ai/mcp` | SIXTA endpoint. |
@@ -182,9 +184,10 @@ GitHub-only: `working_directory` (monorepo subdir), `python_version`, `sarif`
 
 ## Table-size hints (`.sixta.yml`)
 
-SIXTA can't know your table sizes (it never connects). A repo-level `.sixta.yml`
-turns conditional verdicts into concrete duration estimates and risk escalation
-— see [.sixta.yml.example](.sixta.yml.example). Statements touching a hinted
+Without a database connection, SIXTA can't know your table sizes. A repo-level
+`.sixta.yml` turns conditional verdicts into concrete duration estimates and risk
+escalation (see [.sixta.yml.example](.sixta.yml.example)). Connect Pro reads real
+sizes from your database directly, so it needs no hints. Statements touching a hinted
 table are analyzed in their own call so the hints apply precisely. JSON content
 (or `.sixta.json`) works without PyYAML.
 
@@ -207,8 +210,8 @@ reachable database. `SIXTA_SKIP=1 git commit` bypasses it.
 ## Demo
 
 [`example/`](example/) is a tiny Django project with a deliberately risky
-migration — a plain `CREATE INDEX` (blocks writes; SIXTA suggests
-`CONCURRENTLY`) plus a `RunSQL` backfill containing a silent `= NULL` bug — and a
+migration, a plain `CREATE INDEX` (blocks writes; SIXTA suggests
+`CONCURRENTLY`) plus a `RunSQL` backfill containing a silent `= NULL` bug, and a
 `RunPython` migration to show the manual-review flag. Its
 [.gitlab-ci.yml](example/.gitlab-ci.yml) and
 [.github/workflows/sixta.yml](example/.github/workflows/sixta.yml) are the
