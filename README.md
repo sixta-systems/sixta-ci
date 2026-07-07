@@ -22,8 +22,7 @@ your real table sizes, add free `.sixta.yml` hints (below), or connect a read-on
 database with Connect Pro.
 
 > The kit is one stdlib-only Python file (`sixta_review.py`) plus thin platform
-> wrappers. The repo is `sixta-systems/sixta-ci`; the local dev folder may still
-> be named `sixta-review`.
+> wrappers, published from `sixta-systems/sixta-ci`.
 
 ## Quick start: GitLab
 
