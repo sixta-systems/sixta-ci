@@ -33,7 +33,7 @@ sent to `connect.sixta.ai`, analyzed in memory, and never stored
 
 ```yaml
 include:
-  - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.3.1/templates/sixta-review.yml"
+  - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.3.2/templates/sixta-review.yml"
     inputs:
       engine_version: "16"                      # match production — verdicts are version-dependent
       setup: pip install -r requirements.txt    # whatever makes manage.py runnable
@@ -195,7 +195,7 @@ Same verdicts before the push, via the [pre-commit](https://pre-commit.com) fram
 ```yaml
 repos:
   - repo: https://github.com/sixta-systems/sixta-ci
-    rev: v0.3.1
+    rev: v0.3.2
     hooks:
       - id: sixta-review
 ```
