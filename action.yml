@@ -1,5 +1,5 @@
 name: "SIXTA CI: SQL review"
-description: "DBRE-grade SQL review for Django and Alembic migrations and .sql files on your pull requests: lock/blocking analysis, anti-patterns, a PR comment, SARIF, and a gate."
+description: "Catches dangerous SQL migrations in CI: lock analysis, anti-patterns, a PR comment, and a gate. Django, Alembic, .sql."
 author: "SIXTA"
 branding:
   icon: "database"
