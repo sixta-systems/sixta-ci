@@ -1,5 +1,5 @@
-name: "SIXTA CI: SQL review"
-description: "Catches dangerous SQL migrations in CI: lock analysis, anti-patterns, a PR comment, and a gate. Django, Alembic, .sql."
+name: "SIXTA CI: SQL and DDL review"
+description: "Catches dangerous SQL and DDL migrations in CI"
 author: "SIXTA"
 branding:
   icon: "database"
