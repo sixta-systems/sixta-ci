@@ -342,3 +342,9 @@ def test_render_markdown_reports_context_source():
     assert "Production context: **declared hints**" in hints
     free = sr.render_markdown([rep], "high", None)
     assert "Production context" not in free
+    # Grounded-connection guardrail: a live response carrying a note surfaces it.
+    warned = sr.render_markdown([rep], "high", {"source": "live", "note": "Grounded on the default writer (db-a), route its repository."})
+    assert "Grounded on the default writer (db-a), route its repository." in warned
+    assert "⚠" in warned  # warning glyph
+    # No note → no warning line.
+    assert "⚠" not in live

@@ -1031,6 +1031,12 @@ def render_markdown(reports: list[FileReport], gate: str, context: dict | None =
         captured = context.get("captured_at") or ""
         suffix = f" (snapshot {captured})" if captured else ""
         lines.append(f"Production context: **live** database snapshot{suffix}.")
+        # Grounded-connection guardrail: the server flags a writer-first pick among
+        # several databases so a mis-binding (grading this service's migration
+        # against another's database) is visible instead of silent.
+        note = context.get("note")
+        if isinstance(note, str) and note:
+            lines.append(f"⚠️ {note}")
     elif context and context.get("source") in ("hints", "none"):
         source = context.get("source")
         opening = (
