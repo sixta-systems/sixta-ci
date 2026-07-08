@@ -920,6 +920,9 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         request: dict = {"engine": opts.engine, "options": options, "extractions": extractions}
         if opts.engine_version:
             request["version"] = opts.engine_version
+        rref = repo_ref()
+        if rref:
+            request["context"] = {"repo_ref": rref}  # repo→connection routing (Connect Pro)
         schema = capture_schema(opts)
         if schema:
             request["schema"] = {"format": "ddl", "content": schema}
@@ -1123,6 +1126,16 @@ def detect_platform(explicit: str) -> str:
     if explicit != "auto":
         return explicit
     return "github" if os.environ.get("GITHUB_ACTIONS") == "true" else "gitlab"
+
+
+def repo_ref() -> str | None:
+    """The repository identifier from the CI environment (e.g. ``org/app-1``),
+    sent as ``context.repo_ref`` so Connect Pro can route this batch to the
+    connection you bound that repo to. GitHub sets GITHUB_REPOSITORY; GitLab sets
+    CI_PROJECT_PATH. None outside CI (routing then falls back to the writer)."""
+    ref = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("CI_PROJECT_PATH")
+    ref = (ref or "").strip()
+    return ref[:256] or None
 
 
 def github_base_sha() -> Optional[str]:

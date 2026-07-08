@@ -207,6 +207,28 @@ def test_run_v1_passes_schema_and_hints(stub_v1, tmp_path, monkeypatch):
     assert req["options"]["render"] == ["markdown", "code-quality"]
 
 
+def test_run_v1_sends_repo_ref_from_ci_env(stub_v1, tmp_path, monkeypatch):
+    # GitHub sets GITHUB_REPOSITORY; the batch carries it as context.repo_ref so
+    # Connect Pro can route to the bound connection.
+    monkeypatch.delenv("CI_PROJECT_PATH", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "org/app-1")
+    sql = tmp_path / "c.sql"
+    sql.write_text("CREATE INDEX i ON shop_order (status);")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    sr.run_v1([str(sql)], _opts(), client, hints={})
+    assert StubV1Handler.calls[0]["request"]["context"] == {"repo_ref": "org/app-1"}
+
+
+def test_run_v1_omits_context_without_ci_repo(stub_v1, tmp_path, monkeypatch):
+    for var in ("GITHUB_REPOSITORY", "CI_PROJECT_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    sql = tmp_path / "c.sql"
+    sql.write_text("CREATE INDEX i ON shop_order (status);")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    sr.run_v1([str(sql)], _opts(), client, hints={})
+    assert "context" not in StubV1Handler.calls[0]["request"]
+
+
 def test_run_v1_migration_branch_groups_ddl_and_flags_runpython(stub_v1, monkeypatch):
     monkeypatch.setattr(sr, "render_migration", lambda mp, app, name: "CREATE INDEX i ON shop_order (status);")
     monkeypatch.setattr(sr, "has_runpython", lambda path: True)
