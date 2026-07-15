@@ -4,7 +4,7 @@
 # includes on GitLab >= 16.6):
 #
 #   include:
-#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.4.0/templates/sixta-review.yml'
+#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.4.1/templates/sixta-review.yml'
 #       inputs:
 #         engine_version: "16"        # match production!
 #         setup: pip install -r requirements.txt
@@ -65,7 +65,7 @@ spec:
     sixta_url:
       default: "https://connect.sixta.ai/mcp"
     script_ref:
-      default: "v0.4.0"
+      default: "v0.4.1"
       description: Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag.
     postgres_image:
       default: "postgres:16"
