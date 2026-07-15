@@ -216,12 +216,17 @@ def test_ddl_groups_hinted_table_gets_own_call():
 
 class StubHandler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit_once | tool_error | http_401 | http_401_string_error | http_502_html
+    behavior: str = "ok"  # ok | rate_limit_once | tool_error | http_401 | http_401_string_error | http_502_html | http_429_once | http_429_always
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         StubHandler.calls.append({"body": body, "auth": self.headers.get("authorization")})
-        tool = body["params"]["name"]
+        tool = body.get("params", {}).get("name")  # absent for /v1/analyze batches
+        if StubHandler.behavior == "http_429_always" or (
+            StubHandler.behavior == "http_429_once" and len(StubHandler.calls) == 1
+        ):
+            return self._json(429, {"error": {"code": -32000, "message": "Rate limit reached."}},
+                              headers={"Retry-After": "1"})
         if StubHandler.behavior == "http_401":
             return self._json(401, {"jsonrpc": "2.0", "id": body["id"], "error": {
                 "code": -32001, "message": "Missing API key. Get a free key at connect.sixta.ai/portal",
@@ -241,15 +246,17 @@ class StubHandler(BaseHTTPRequestHandler):
             result = {"content": [{"type": "text", "text": "**SIXTA schema-change analysis**"}], "structuredContent": SCHEMA_STRUCT}
         else:
             result = {"content": [{"type": "text", "text": "**SIXTA query analysis**"}], "structuredContent": QUERY_STRUCT}
-        self._json(200, {"jsonrpc": "2.0", "id": body["id"], "result": result})
+        self._json(200, {"jsonrpc": "2.0", "id": body.get("id"), "result": result})
 
-    def _json(self, status, body):
-        self._respond(status, json.dumps(body).encode())
+    def _json(self, status, body, headers=None):
+        self._respond(status, json.dumps(body).encode(), headers=headers)
 
-    def _respond(self, status, payload, ctype="application/json"):
+    def _respond(self, status, payload, ctype="application/json", headers=None):
         self.send_response(status)
         self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -283,6 +290,31 @@ def test_client_retries_rate_limit(stub_server):
     result = client.call("sixta_analyze_query", {"query": "SELECT 1"})
     assert len(StubHandler.calls) == 2
     assert result["structuredContent"]["verdict"] == "findings"
+
+
+def test_client_retries_http_429(stub_server):
+    StubHandler.behavior = "http_429_once"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    result = client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert len(StubHandler.calls) == 2
+    assert result["structuredContent"]["verdict"] == "findings"
+
+
+def test_client_persistent_http_429_raises(stub_server):
+    StubHandler.behavior = "http_429_always"
+    client = sr.SixtaClient(stub_server, api_key=None, max_retries=1)
+    with pytest.raises(sr.SixtaToolError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert len(StubHandler.calls) == 2  # initial attempt + 1 retry
+    assert "HTTP 429" in str(exc.value)
+
+
+def test_analyze_v1_retries_http_429(stub_server):
+    StubHandler.behavior = "http_429_once"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    response = client.analyze_v1({"engine": "postgresql", "extractions": []})
+    assert len(StubHandler.calls) == 2
+    assert "result" in response  # the stub's generic 200 body came through
 
 
 def test_client_tool_error_raises(stub_server):
