@@ -589,6 +589,58 @@ def resolve_engine(explicit: Optional[str]) -> str:
     return detected or "postgresql"
 
 
+# JPA schema management without a migration tool (Phase S4): with
+# ddl-auto=create/update, Hibernate mutates the schema at boot, so schema
+# changes never show up in a PR as SQL and CI review is blind to them.
+_DDL_AUTO_PROPS_RE = re.compile(
+    r"^\s*(?:spring\.jpa\.hibernate\.ddl-auto|spring\.jpa\.properties\.hibernate\.hbm2ddl\.auto|hibernate\.hbm2ddl\.auto)"
+    r"\s*[=:]\s*[\"']?(create-drop|create|update)[\"']?\s*$", re.M)
+_DDL_AUTO_YML_RE = re.compile(r"^\s*ddl-auto\s*:\s*[\"']?(create-drop|create|update)[\"']?\s*$", re.M)
+_MIGRATION_TOOL_RE = re.compile(r"flyway|liquibase", re.I)
+
+_DDL_AUTO_SECTION = ("_Hibernate `ddl-auto` manages this repo's schema with no migration tool: schema changes "
+                     "never appear in a PR as SQL, so they cannot be reviewed here. Emit a DDL script "
+                     "(`spring.jpa.properties.jakarta.persistence.schema-generation.scripts.action=create`) "
+                     "or adopt Flyway/Liquibase._")
+
+
+def jpa_ddl_auto_unmanaged(root: str = ".") -> Optional[tuple[str, str]]:
+    """(config path, ddl-auto value) when Hibernate generates the schema
+    (create/update/create-drop) and no migration tool appears anywhere in the
+    build/config files. None when a migration tool is present (mixed setups
+    manage their schema properly) or ddl-auto is validate/none/absent."""
+    hit: Optional[tuple[str, str]] = None
+    for path, text in _spring_files(root):
+        if _MIGRATION_TOOL_RE.search(text):
+            return None
+        if hit is None:
+            m = _DDL_AUTO_PROPS_RE.search(text) if path.endswith(".properties") else _DDL_AUTO_YML_RE.search(text)
+            if m:
+                hit = (path, m.group(1))
+    return hit
+
+
+def append_ddl_auto_note(reports: list["FileReport"], root: str = ".") -> None:
+    """One informational finding per run when the repo's schema is Hibernate-
+    managed and invisible to review. Logged always; attached to the report only
+    when the run analyzed something (never the sole content of a PR comment)."""
+    hit = jpa_ddl_auto_unmanaged(root)
+    if not hit:
+        return
+    path, value = hit
+    desc = (f"SIXTA: spring.jpa.hibernate.ddl-auto={value} with no migration tool. Hibernate mutates the "
+            f"schema at boot; schema changes never appear in a PR and were NOT reviewed. Emit a DDL script "
+            f"(jakarta.persistence.schema-generation.scripts.action=create) or adopt Flyway/Liquibase.")
+    info(desc[len("SIXTA: "):])
+    if not reports:
+        return
+    rep = FileReport(path=os.path.normpath(path))
+    rep.findings.append(Finding(path=os.path.normpath(path), severity="Info", description=desc,
+                                check_name="jpa-ddl-auto-unmanaged"))
+    rep.sections.append(_DDL_AUTO_SECTION)
+    reports.append(rep)
+
+
 def flyway_placeholders(root: str = ".") -> dict[str, str]:
     """Configured placeholder values (``spring.flyway.placeholders.<name>``)
     from Spring config: .properties parsed directly, .yml/.yaml via PyYAML when
@@ -2140,6 +2192,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         reports, server_renders, v1_context, server_worst = run_v1(files, opts, client, hints)
     else:
         reports = analyze_files(files, opts, client, hints)
+    append_ddl_auto_note(reports)
     markdown = render_markdown(reports, opts.gate, v1_context)
 
     if opts.local:
