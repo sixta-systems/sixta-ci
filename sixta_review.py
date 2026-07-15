@@ -286,19 +286,31 @@ class SixtaClient:
         rate-limit/errors ride inside ``results``); a 4xx/5xx carries a REST
         error body ``{error: {code, message}}`` and becomes a SixtaToolError,
         while transport failures — including gateway errors and unfollowed
-        redirects, see ``_http_error`` — become a SixtaConnectivityError."""
+        redirects, see ``_http_error`` — become a SixtaConnectivityError.
+        The exception is HTTP 429 (a gateway enforcing rate limits before the
+        route can answer 200): that is backed off and retried like the MCP
+        path, since under --fail-mode=closed it would otherwise fail the run
+        on a transient condition."""
         payload = json.dumps(request).encode()
         headers = {"content-type": "application/json"}
         if self.api_key:
             headers["authorization"] = f"Bearer {self.api_key}"
-        try:
-            req = urllib.request.Request(self.v1_url, data=payload, headers=headers)
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
-            raise _http_error(exc, self.v1_url) from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-            raise SixtaConnectivityError(f"POST {self.v1_url} failed: {exc}") from exc
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                req = urllib.request.Request(self.v1_url, data=payload, headers=headers)
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
+                if exc.code == 429 and attempt <= self.max_retries:
+                    wait = _retry_after_http(exc)
+                    warn(f"rate limited on /v1/analyze (HTTP 429); backing off {wait}s (attempt {attempt}/{self.max_retries})")
+                    time.sleep(wait)
+                    continue
+                raise _http_error(exc, self.v1_url) from exc
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                raise SixtaConnectivityError(f"POST {self.v1_url} failed: {exc}") from exc
 
     def call(self, tool: str, arguments: dict) -> dict:
         """Return the MCP CallToolResult ({content, structuredContent?, isError?})."""
@@ -318,6 +330,11 @@ class SixtaClient:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode())
             except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
+                if exc.code == 429 and attempt <= self.max_retries:
+                    wait = _retry_after_http(exc)
+                    warn(f"rate limited on {tool} (HTTP 429); backing off {wait}s (attempt {attempt}/{self.max_retries})")
+                    time.sleep(wait)
+                    continue
                 raise _http_error(exc, self.url) from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
                 raise SixtaConnectivityError(f"POST {self.url} failed: {exc}") from exc
@@ -368,6 +385,21 @@ def _result_text(result: dict) -> str:
 def _retry_after_seconds(text: str, default: int = 30) -> int:
     m = re.search(r"wait about (\d+)s", text)
     return min(int(m.group(1)) if m else default, 120)
+
+
+def _retry_after_http(exc: urllib.error.HTTPError) -> int:
+    """Backoff for an HTTP-level 429: honor an integer Retry-After header,
+    falling back to the in-band parser on the error body (and its default).
+    Reading the body here is fine — the caller retries instead of handing
+    the (now-consumed) response to ``_http_error``."""
+    header = (exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
+    if header.isdigit():  # HTTP-date form falls through to the body/default
+        return min(int(header), 120)
+    try:
+        text = exc.read().decode()
+    except (ValueError, OSError, http.client.HTTPException):
+        text = ""
+    return _retry_after_seconds(text)
 
 
 # --------------------------------------------------------------------------
