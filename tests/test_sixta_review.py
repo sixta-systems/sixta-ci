@@ -1,7 +1,10 @@
 """Unit + integration tests for sixta_review (stub MCP server, no network)."""
 
+import http.client
+import io
 import json
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -213,12 +216,20 @@ def test_ddl_groups_hinted_table_gets_own_call():
 
 class StubHandler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit_once | tool_error
+    behavior: str = "ok"  # ok | rate_limit_once | tool_error | http_401 | http_401_string_error | http_502_html
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         StubHandler.calls.append({"body": body, "auth": self.headers.get("authorization")})
         tool = body["params"]["name"]
+        if StubHandler.behavior == "http_401":
+            return self._json(401, {"jsonrpc": "2.0", "id": body["id"], "error": {
+                "code": -32001, "message": "Missing API key. Get a free key at connect.sixta.ai/portal",
+            }})
+        if StubHandler.behavior == "http_401_string_error":
+            return self._json(401, {"error": "unauthorized"})  # non-envelope body, e.g. from a proxy
+        if StubHandler.behavior == "http_502_html":
+            return self._respond(502, b"<html>Bad Gateway</html>", ctype="text/html")
         if StubHandler.behavior == "rate_limit_once" and len(StubHandler.calls) == 1:
             result = {
                 "content": [{"type": "text", "text": "Rate limit reached. wait about 1s and try again."}],
@@ -230,9 +241,14 @@ class StubHandler(BaseHTTPRequestHandler):
             result = {"content": [{"type": "text", "text": "**SIXTA schema-change analysis**"}], "structuredContent": SCHEMA_STRUCT}
         else:
             result = {"content": [{"type": "text", "text": "**SIXTA query analysis**"}], "structuredContent": QUERY_STRUCT}
-        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
+        self._json(200, {"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+    def _json(self, status, body):
+        self._respond(status, json.dumps(body).encode())
+
+    def _respond(self, status, payload, ctype="application/json"):
+        self.send_response(status)
+        self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -273,6 +289,40 @@ def test_client_tool_error_raises(stub_server):
     StubHandler.behavior = "tool_error"
     with pytest.raises(sr.SixtaToolError):
         sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
+
+
+def test_client_http_error_surfaces_server_message(stub_server):
+    StubHandler.behavior = "http_401"
+    with pytest.raises(sr.SixtaToolError) as exc:
+        sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "connect.sixta.ai/portal" in str(exc.value)
+    assert "HTTP 401" in str(exc.value)  # status + URL kept for diagnosability
+    assert stub_server in str(exc.value)
+
+
+def test_client_http_error_tolerates_non_envelope_body(stub_server):
+    StubHandler.behavior = "http_401_string_error"  # {"error": "unauthorized"} — no .message dict
+    with pytest.raises(sr.SixtaToolError) as exc:
+        sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "HTTP 401" in str(exc.value)
+
+
+def test_client_gateway_error_is_connectivity(stub_server):
+    StubHandler.behavior = "http_502_html"  # LB answers for a down service, non-JSON body
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "HTTP 502" in str(exc.value)
+
+
+def test_http_error_helper_survives_truncated_body():
+    class _Truncated(io.BytesIO):
+        def read(self, *args, **kwargs):
+            raise http.client.IncompleteRead(b"x")
+
+    exc = urllib.error.HTTPError("http://x/mcp", 500, "boom", {}, _Truncated())
+    err = sr._http_error(exc, "http://x/mcp")
+    assert isinstance(err, sr.SixtaToolError)
+    assert "HTTP 500" in str(err)
 
 
 def test_client_connectivity_error():
