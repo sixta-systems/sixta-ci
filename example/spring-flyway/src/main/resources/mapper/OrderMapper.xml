@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!-- MyBatis demo: the ${sortColumn} interpolation is flagged as an injection
+     risk; #{status} is a safe bound parameter. -->
+<mapper namespace="com.example.shop.OrderMapper">
+  <select id="byStatus" resultType="Order">
+    SELECT id, customer_id, status, total FROM orders
+    <where>
+      <if test="status != null">AND status = #{status}</if>
+    </where>
+    ORDER BY ${sortColumn}
+  </select>
+</mapper>

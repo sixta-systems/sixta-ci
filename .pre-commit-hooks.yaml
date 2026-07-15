@@ -13,6 +13,6 @@
   name: SIXTA SQL migration review
   entry: sixta-review --local
   language: python
-  files: '(^|/)migrations/.*\.py$|\.sql$'
+  files: '(^|/)migrations/.*\.py$|\.sql$|\.java$|(^|/)mappers?/.*\.xml$|(^|/)db/changelog/.*'
   exclude: '(^|/)migrations/__init__\.py$'
   pass_filenames: true
