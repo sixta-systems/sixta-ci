@@ -145,10 +145,30 @@ Flyway conventions:
   that only `include`s others is never rendered: leaf changelogs are analyzed
   when they themselves change.
 
+**SQL inside application code** is reviewed too (no other migration linter does
+this): when a changed `.java` file or MyBatis mapper carries native SQL, the kit
+extracts and analyzes it as queries.
+
+- **Annotations**: `@Query(nativeQuery = true)`, `@NativeQuery`,
+  `@NamedNativeQuery`, and Spring Data JDBC / R2DBC `@Query` (always native
+  there). Plain JPA `@Query` is JPQL, not SQL, and is deliberately skipped
+  (feeding entity-language queries to a SQL analyzer only creates false
+  positives).
+- **Call sites**: `JdbcTemplate` / `NamedParameterJdbcTemplate` / `JdbcClient` /
+  `DatabaseClient` query methods and `createNativeQuery(...)`, including text
+  blocks, `"a" + "b"` concatenation, and String constants defined in the same
+  file. Dynamically assembled SQL is out of static reach.
+- **MyBatis XML mappers**: statement bodies are flattened to one analyzable
+  branch (`<where>`/`<set>`/`<if>`/`<include>` resolved, `<choose>` takes its
+  first `<when>`), `#{...}` parameters become placeholders, and any `${...}`
+  string interpolation is flagged as an injection risk in its own right.
+- Parameter syntaxes are normalized before analysis: `?1` positional, SpEL
+  `:#{...}`, and MyBatis `#{...}`; plain `:name` and `?` pass through.
+
 On GitHub, trigger the workflow with
-`paths: ["**/db/migration/**", "**/db/changelog/**", "**/*.sql"]` and skip the
-`postgres` service, `DATABASE_URL`, and (for Flyway or SQL-format Liquibase)
-the `setup` input entirely.
+`paths: ["**/db/migration/**", "**/db/changelog/**", "**/*.sql", "**/*.java", "**/mapper/**/*.xml"]`
+and skip the `postgres` service, `DATABASE_URL`, and (for Flyway or SQL-format
+Liquibase) the `setup` input entirely.
 
 ## How it works
 

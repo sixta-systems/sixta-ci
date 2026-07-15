@@ -83,6 +83,9 @@ sixta-review:
         - "**/*.sql"
         - "**/db/migration/**" # Flyway, including Java-based migrations
         - "**/db/changelog/**" # Liquibase changelogs
+        - "**/*.java" # embedded SQL: @Query(nativeQuery), JdbcTemplate/JdbcClient
+        - "**/mapper/**/*.xml" # MyBatis mappers
+        - "**/mappers/**/*.xml"
   services:
     # sqlmigrate needs a live connection (Django resolves constraint names
     # through the schema editor). An empty database is fine.
