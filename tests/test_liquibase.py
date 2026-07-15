@@ -176,7 +176,9 @@ def test_extract_migration_renders_leaf_with_cli(tmp_path, monkeypatch):
     assert "DATABASECHANGELOG" not in sql  # bookkeeping stripped
     assert seen["cmd"][0] == "liquibase" and "update-sql" in seen["cmd"]
     assert f"--changelog-file={f}" in seen["cmd"]
-    assert "--url=offline:postgresql" in seen["cmd"]
+    # stateless offline URL: a throwaway state CSV, never ./databasechangelog.csv
+    url = next(a for a in seen["cmd"] if a.startswith("--url="))
+    assert url.startswith("--url=offline:postgresql?changeLogFile=")
 
 
 def test_extract_migration_master_index_is_flagged_not_rendered(tmp_path, monkeypatch):
@@ -211,32 +213,65 @@ def test_render_liquibase_respects_engine_and_cmd(tmp_path, monkeypatch):
     monkeypatch.setattr(sr.subprocess, "run", lambda cmd, **kw: seen.update(cmd=cmd) or _proc(0, "SELECT 1;"))
     sr.render_liquibase(str(f), _opts(engine="mysql", liquibase_cmd="/opt/liquibase/liquibase"))
     assert seen["cmd"][0] == "/opt/liquibase/liquibase"
-    assert "--url=offline:mysql" in seen["cmd"]
+    url = next(a for a in seen["cmd"] if a.startswith("--url="))
+    assert url.startswith("--url=offline:mysql?changeLogFile=")
 
 
 # --------------------------------------------------------------------------
-# Structured rollback audit
+# Structured rollback audit: changelog-sync into a temp state CSV, then
+# rollback-count-sql with an overshoot count (the real CLI's working recipe;
+# future-rollback-sql renders nothing offline).
 # --------------------------------------------------------------------------
 
-def test_structured_rollback_success(tmp_path, monkeypatch):
+def _rollback_runner(seen, sync=_proc(0), rollback=_proc(0, "DROP TABLE t;")):
+    def run(cmd, **kw):
+        seen.append(cmd)
+        if cmd[-1] == "changelog-sync":
+            return sync
+        assert cmd[-2:] == ["rollback-count-sql", "999999"]
+        return rollback
+    return run
+
+
+def test_structured_rollback_syncs_then_renders(tmp_path, monkeypatch):
     f = tmp_path / "leaf.xml"
     f.write_text(XML_LEAF)
-    monkeypatch.setattr(sr.subprocess, "run", lambda cmd, **kw: _proc(0, "DROP TABLE t;"))
+    seen: list = []
+    monkeypatch.setattr(sr.subprocess, "run", _rollback_runner(seen))
     assert sr.extract_rollback(str(f), _opts()) == {"sql": "DROP TABLE t;"}
+    assert [c[-1] for c in seen] == ["changelog-sync", "999999"]
+    # both invocations share the same throwaway state CSV
+    urls = {next(a for a in c if a.startswith("--url=")) for c in seen}
+    assert len(urls) == 1 and "changeLogFile=" in urls.pop()
 
 
 def test_structured_rollback_impossible_is_missing(tmp_path, monkeypatch):
     f = tmp_path / "leaf.xml"
     f.write_text(XML_LEAF)
     err = "Unexpected error running Liquibase: liquibase.exception.RollbackImpossibleException: No inverse to liquibase.change.core.RawSQLChange created"
-    monkeypatch.setattr(sr.subprocess, "run", lambda cmd, **kw: _proc(1, "", err))
+    monkeypatch.setattr(sr.subprocess, "run", _rollback_runner([], rollback=_proc(1, "", err)))
     assert sr.extract_rollback(str(f), _opts()) == {"status": "missing"}
+
+
+def test_structured_rollback_sync_failure_unchecked(tmp_path, monkeypatch):
+    f = tmp_path / "leaf.xml"
+    f.write_text(XML_LEAF)
+    monkeypatch.setattr(sr.subprocess, "run", _rollback_runner([], sync=_proc(1, "", "locked")))
+    assert sr.extract_rollback(str(f), _opts()) is None
+
+
+def test_structured_rollback_comment_only_output_unchecked(tmp_path, monkeypatch):
+    f = tmp_path / "leaf.xml"
+    f.write_text(XML_LEAF)
+    banner = "-- ****************\n-- SQL to roll back\n-- ****************\n"
+    monkeypatch.setattr(sr.subprocess, "run", _rollback_runner([], rollback=_proc(0, banner)))
+    assert sr.extract_rollback(str(f), _opts()) is None
 
 
 def test_structured_rollback_other_failure_unchecked(tmp_path, monkeypatch):
     f = tmp_path / "leaf.xml"
     f.write_text(XML_LEAF)
-    monkeypatch.setattr(sr.subprocess, "run", lambda cmd, **kw: _proc(1, "", "boom"))
+    monkeypatch.setattr(sr.subprocess, "run", _rollback_runner([], rollback=_proc(1, "", "boom")))
     assert sr.extract_rollback(str(f), _opts()) is None
 
 

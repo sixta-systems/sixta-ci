@@ -41,8 +41,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -637,7 +639,11 @@ def substitute_flyway_placeholders(sql: str, values: dict) -> str:
 #   audit, `--property` values substitute ${...}. Only changesets that are new
 #   or edited vs the diff base are analyzed (changelogs are append-mostly).
 # * XML/YAML/JSON — rendered to SQL via the Liquibase CLI in offline mode
-#   (`--url=offline:<engine>`, no database); rollback via future-rollback-sql.
+#   (`--url=offline:<engine>`, no database). Offline connections persist
+#   executed changesets to a state CSV (./databasechangelog.csv by default!),
+#   so every invocation here points changeLogFile= at a throwaway temp CSV.
+#   Rollback = changelog-sync (mark all executed in the temp state) followed
+#   by rollback-count-sql with an overshoot count (Liquibase clamps it).
 #   A changelog that only includes other changelogs (the master/index) is not
 #   rendered: its leaves are analyzed when they themselves change.
 # --------------------------------------------------------------------------
@@ -800,53 +806,77 @@ def _liquibase_engine(opts: argparse.Namespace) -> str:
 
 
 def _strip_liquibase_bookkeeping(sql: str) -> str:
-    stmts = [s for s in split_statements(sql) if not _LIQUIBASE_BOOKKEEPING_RE.search(s)]
+    """Drop DATABASECHANGELOG bookkeeping and comment-only blocks (the CLI's
+    header banner would otherwise pass for SQL)."""
+    stmts = [s for s in split_statements(sql)
+             if _first_keyword(s) and not _LIQUIBASE_BOOKKEEPING_RE.search(s)]
     return ";\n".join(stmts) + (";" if stmts else "")
+
+
+def _offline_state_dir() -> tuple[str, str]:
+    """A throwaway offline-state CSV path (inside its own temp dir so cleanup
+    is one rmtree). The file must not pre-exist: Liquibase creates it."""
+    tmpdir = tempfile.mkdtemp(prefix="sixta-liquibase-")
+    return tmpdir, os.path.join(tmpdir, "state.csv")
 
 
 def render_liquibase(path: str, opts: argparse.Namespace) -> str:
     """Offline render of an XML/YAML/JSON changelog via the Liquibase CLI
     (mechanism A): ``update-sql`` against ``offline:<engine>`` needs no
-    database. Renders the whole (leaf) changelog; DATABASECHANGELOG
-    bookkeeping is suppressed and stripped."""
+    database. The offline state CSV goes to a temp file so repeated runs
+    stay stateless (the default would persist ./databasechangelog.csv and
+    silently render nothing the second time). Renders the whole (leaf)
+    changelog; bookkeeping and comment banners are stripped."""
     engine = _liquibase_engine(opts)
+    tmpdir, state = _offline_state_dir()
     cmd = [_liquibase_cli(opts), "--search-path=.", f"--changelog-file={path}",
-           f"--url=offline:{engine}", "update-sql"]
+           f"--url=offline:{engine}?changeLogFile={state}", "update-sql"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except OSError as exc:
         raise RuntimeError(
             f"liquibase CLI not available ({exc}) — install it in the CI job (see README, Spring Boot / "
             f"Liquibase) to analyze XML/YAML changelogs, or keep changelogs in SQL format")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     if proc.returncode != 0:
         raise RuntimeError(f"liquibase update-sql for {os.path.basename(path)} failed:\n{proc.stderr.strip()[:400]}")
     return _strip_liquibase_bookkeeping(proc.stdout)
 
 
 def liquibase_structured_rollback(path: str, opts: argparse.Namespace) -> Optional[dict]:
-    """Rollback audit for an XML/YAML/JSON changelog: offline
-    ``future-rollback-sql`` renders the reverse of every unapplied (here: all)
-    changeset. A changeset with no auto-inverse and no <rollback> block makes
-    Liquibase fail with a rollback-impossible error -> ``missing``; other
-    failures leave the audit unchecked."""
+    """Rollback audit for an XML/YAML/JSON changelog, verified against the
+    real CLI: ``changelog-sync`` marks every changeset executed in a throwaway
+    offline state CSV, then ``rollback-count-sql`` with an overshoot count
+    renders the reverse of all of them (Liquibase clamps the count;
+    ``future-rollback-sql`` renders nothing offline). A changeset with no
+    auto-inverse and no <rollback> block fails with a rollback-impossible
+    error -> ``missing``; other failures leave the audit unchecked."""
     engine = _liquibase_engine(opts)
-    cmd = [_liquibase_cli(opts), "--search-path=.", f"--changelog-file={path}",
-           f"--url=offline:{engine}", "future-rollback-sql"]
+    tmpdir, state = _offline_state_dir()
+    base = [_liquibase_cli(opts), "--search-path=.", f"--changelog-file={path}",
+            f"--url=offline:{engine}?changeLogFile={state}"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        sync = subprocess.run(base + ["changelog-sync"], capture_output=True, text=True)
+        if sync.returncode != 0:
+            info(f"rollback: liquibase changelog-sync for {os.path.basename(path)} exited {sync.returncode} — rollback unchecked")
+            return None
+        proc = subprocess.run(base + ["rollback-count-sql", "999999"], capture_output=True, text=True)
     except OSError as exc:
-        info(f"rollback: liquibase future-rollback-sql could not run ({exc}) — rollback unchecked")
+        info(f"rollback: liquibase rollback render could not run ({exc}) — rollback unchecked")
         return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     if proc.returncode == 0:
         sql = _strip_liquibase_bookkeeping(proc.stdout)
         if sql.strip():
             return {"sql": sql}
-        info(f"rollback: liquibase future-rollback-sql for {os.path.basename(path)} rendered nothing — rollback unchecked")
+        info(f"rollback: liquibase rollback render for {os.path.basename(path)} rendered nothing — rollback unchecked")
         return None
     err = proc.stderr.lower()
     if "rollbackimpossible" in err or "no inverse" in err or "does not support rollback" in err:
         return {"status": "missing"}
-    info(f"rollback: liquibase future-rollback-sql for {os.path.basename(path)} exited {proc.returncode} — rollback unchecked")
+    info(f"rollback: liquibase rollback render for {os.path.basename(path)} exited {proc.returncode} — rollback unchecked")
     return None
 
 
