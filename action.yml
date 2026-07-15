@@ -23,7 +23,7 @@ inputs:
     description: "Fail the check when any finding is at or above this severity (critical/high/medium/low/none)."
     default: "high"
   fail_mode:
-    description: "open = SIXTA unreachable -> warn and pass; closed -> fail. Findings always gate."
+    description: "open = SIXTA unreachable -> warn and pass; closed -> fail. Findings always gate. A rejected API key (401/403) always fails, regardless of mode."
     default: "open"
   api:
     description: "mcp or v1. Defaults to v1 (one batch POST per run, server-rendered SARIF)."

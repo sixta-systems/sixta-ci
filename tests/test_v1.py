@@ -78,7 +78,7 @@ def _v1_response(request: dict) -> dict:
 
 class StubV1Handler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit | extraction_error | http_error
+    behavior: str = "ok"  # ok | rate_limit | extraction_error | http_error | http_401 | http_503
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers["content-length"]))
@@ -89,6 +89,10 @@ class StubV1Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": {"code": "not_found", "message": "not found"}})
         if StubV1Handler.behavior == "http_error":
             return self._json(413, {"error": {"code": "payload_too_large", "message": "body too big"}})
+        if StubV1Handler.behavior == "http_401":
+            return self._json(401, {"error": {"code": "unauthorized", "message": "invalid API key"}})
+        if StubV1Handler.behavior == "http_503":
+            return self._json(503, {"error": {"code": "unavailable", "message": "deploy in progress"}})
 
         resp = _v1_response(request)
         if StubV1Handler.behavior == "advisory_worst" and resp["results"]:
@@ -159,6 +163,23 @@ def test_analyze_v1_http_error_raises_tool_error(stub_v1):
     with pytest.raises(sr.SixtaToolError) as exc:
         client.analyze_v1({"engine": "postgresql", "extractions": [{"kind": "query", "sql": "SELECT 1"}]})
     assert "body too big" in str(exc.value)
+
+
+def test_analyze_v1_http_401_names_auth_and_url(stub_v1):
+    StubV1Handler.behavior = "http_401"
+    client = sr.SixtaClient(stub_v1, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.analyze_v1({"engine": "postgresql", "extractions": [{"kind": "query", "sql": "SELECT 1"}]})
+    msg = str(exc.value)
+    assert "HTTP 401" in msg and "SIXTA_API_KEY" in msg and "/v1/analyze" in msg
+
+
+def test_analyze_v1_http_5xx_is_connectivity(stub_v1):
+    StubV1Handler.behavior = "http_503"
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.analyze_v1({"engine": "postgresql", "extractions": [{"kind": "query", "sql": "SELECT 1"}]})
+    assert "HTTP 503" in str(exc.value)
 
 
 def test_analyze_v1_connectivity_error():

@@ -168,7 +168,7 @@ Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
 |---|---|---|
 | `engine` / `engine_version` | `postgresql` / none | **Set the version to match production.** |
 | `gate` | `high` | Fail at ≥ this severity: `critical`, `high`, `medium`, `low`, `none`. |
-| `fail_mode` | `open` | SIXTA unreachable → `open`: warn & pass; `closed`: fail. Findings always gate. |
+| `fail_mode` | `open` | SIXTA unreachable → `open`: warn & pass; `closed`: fail. Findings always gate. A rejected API key (HTTP 401/403) always fails, regardless of mode. |
 | `api` | `v1` (GitHub) / `mcp` (GitLab) | `v1` batches the whole run into one `POST /v1/analyze`. |
 | `schema_cmd` | none | `v1` only: command whose stdout is the shared schema DDL (default `pg_dump` when a DB is configured). |
 | `require_rollback` | `false` | `v1` only: raise the "no rollback prepared" finding to gate-able severity. See "Rollback audit". |

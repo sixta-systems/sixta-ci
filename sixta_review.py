@@ -46,7 +46,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import NoReturn, Optional
 
 __version__ = "0.3.0"
 
@@ -256,6 +256,61 @@ class SixtaToolError(Exception):
     pass
 
 
+class SixtaAuthError(SixtaToolError):
+    """The server rejected the API key (HTTP 401/403 or an auth-flavored
+    JSON-RPC error). A persistent misconfiguration, not a transient outage:
+    callers gate on it regardless of --fail-mode."""
+
+
+_AUTH_HINT = " — authentication failed; check SIXTA_API_KEY"
+
+
+def _http_error_message(exc: urllib.error.HTTPError, url: str) -> str:
+    """Human-readable message for an HTTP error response. The JSON error body
+    is best-effort context only — no body shape or read failure may mask the
+    status code."""
+    detail = ""
+    try:
+        err_body = json.loads(exc.read().decode())
+        err = err_body.get("error") if isinstance(err_body, dict) else None
+        if isinstance(err, dict):
+            detail = err.get("message") or ""
+        elif isinstance(err, str):
+            detail = err
+    except Exception:  # e.g. IncompleteRead, non-JSON body, wrong charset
+        detail = ""
+    msg = f"HTTP {exc.code} from {url}"
+    if detail:
+        msg += f": {detail}"
+    if exc.code in (401, 403):
+        msg += _AUTH_HINT
+    return msg
+
+
+def _raise_http_error(exc: urllib.error.HTTPError, url: str) -> NoReturn:
+    """Classify an HTTP error response: 401/403 is an auth misconfiguration,
+    5xx means the server is effectively unreachable (keeps the documented
+    "SIXTA unreachable" fail-mode semantics), any other 4xx is a tool error."""
+    msg = _http_error_message(exc, url)
+    if exc.code in (401, 403):
+        raise SixtaAuthError(msg) from exc
+    if exc.code >= 500:
+        raise SixtaConnectivityError(msg) from exc
+    raise SixtaToolError(msg) from exc
+
+
+def _looks_like_auth_error(text: str) -> bool:
+    t = text.lower()
+    return any(marker in t for marker in ("unauthorized", "forbidden", "api key", "authentication"))
+
+
+def _retry_after_header_seconds(value: Optional[str], default: int = 30) -> int:
+    try:
+        return min(max(int(value), 0), 120)
+    except (TypeError, ValueError):
+        return default
+
+
 def v1_endpoint(mcp_url: str) -> str:
     """Derive the /v1/analyze URL from a configured /mcp URL."""
     if mcp_url.endswith("/mcp"):
@@ -290,12 +345,7 @@ class SixtaClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
-            try:
-                body = json.loads(exc.read().decode())
-                msg = (body.get("error") or {}).get("message") or f"HTTP {exc.code}"
-            except (ValueError, OSError):
-                msg = f"HTTP {exc.code}"
-            raise SixtaToolError(msg) from exc
+            _raise_http_error(exc, self.v1_url)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             raise SixtaConnectivityError(f"POST {self.v1_url} failed: {exc}") from exc
 
@@ -317,22 +367,21 @@ class SixtaClient:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode())
             except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
-                try:
-                    err_body = json.loads(exc.read().decode())
-                    detail = (err_body.get("error") or {}).get("message") or ""
-                except (ValueError, OSError):
-                    detail = ""
-                msg = f"HTTP {exc.code} from {self.url}"
-                if detail:
-                    msg += f": {detail}"
-                if exc.code in (401, 403):
-                    msg += " — authentication failed; check SIXTA_API_KEY"
-                raise SixtaToolError(msg) from exc
+                if exc.code == 429 and attempt <= self.max_retries:
+                    wait = _retry_after_header_seconds(exc.headers.get("retry-after"))
+                    warn(f"rate limited (HTTP 429) on {tool}; backing off {wait}s (attempt {attempt}/{self.max_retries})")
+                    time.sleep(wait)
+                    continue
+                _raise_http_error(exc, self.url)
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
                 raise SixtaConnectivityError(f"POST {self.url} failed: {exc}") from exc
 
             if "error" in body:  # JSON-RPC level error (auth, body cap, ...)
-                raise SixtaToolError(body["error"].get("message", str(body["error"])))
+                err = body["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                if _looks_like_auth_error(msg):
+                    raise SixtaAuthError(msg + _AUTH_HINT)
+                raise SixtaToolError(msg)
             result = body.get("result") or {}
             if result.get("isError"):
                 text = _result_text(result)
@@ -790,6 +839,10 @@ def _run_tool(client: SixtaClient, tool: str, args: dict, report: FileReport, fa
         warn(str(exc))
         report.skipped.append(f"{tool}: SIXTA unreachable — analysis skipped (fail-open). {exc}")
         return
+    except SixtaAuthError as exc:
+        # A rejected key is a persistent misconfiguration: failing open would
+        # leave CI green (and analysis silently skipped) on every future run.
+        die(f"SIXTA rejected the API key: {exc}", code=2)
     except SixtaToolError as exc:
         if fail_mode == "closed":
             die(f"SIXTA tool error and --fail-mode=closed: {exc}", code=2)
@@ -947,6 +1000,9 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         except SixtaConnectivityError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA unreachable — batch analysis skipped (fail-open). {exc}", exc)
             return [reports[p] for p in order], None, None, None
+        except SixtaAuthError as exc:
+            # Persistent misconfiguration — never fail open (see _run_tool).
+            die(f"SIXTA rejected the API key: {exc}", code=2)
         except SixtaToolError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA error — batch analysis skipped (fail-open). {exc}", exc)
             return [reports[p] for p in order], None, None, None

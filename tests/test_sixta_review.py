@@ -1,7 +1,10 @@
 """Unit + integration tests for sixta_review (stub MCP server, no network)."""
 
+import http.client
+import io
 import json
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -213,20 +216,26 @@ def test_ddl_groups_hinted_table_gets_own_call():
 
 class StubHandler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit_once | tool_error | http_401
+    # ok | rate_limit_once | tool_error | http_401 | http_401_string_error
+    # | http_503 | http_429_once | rpc_auth_error
+    behavior: str = "ok"
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         StubHandler.calls.append({"body": body, "auth": self.headers.get("authorization")})
         tool = body["params"]["name"]
         if StubHandler.behavior == "http_401":
-            payload = json.dumps({"error": {"code": "unauthorized", "message": "invalid API key"}}).encode()
-            self.send_response(401)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
+            return self._json(401, {"error": {"code": "unauthorized", "message": "invalid API key"}})
+        if StubHandler.behavior == "http_401_string_error":
+            return self._json(401, {"error": "unauthorized"})  # REST shape some proxies use
+        if StubHandler.behavior == "http_503":
+            return self._json(503, {"error": {"code": "unavailable", "message": "deploy in progress"}})
+        if StubHandler.behavior == "http_429_once" and len(StubHandler.calls) == 1:
+            return self._json(429, {"error": {"code": "rate_limited", "message": "slow down"}},
+                              headers={"retry-after": "0"})
+        if StubHandler.behavior == "rpc_auth_error":
+            return self._json(200, {"jsonrpc": "2.0", "id": body["id"],
+                                    "error": {"code": -32001, "message": "Unauthorized: invalid API key"}})
         if StubHandler.behavior == "rate_limit_once" and len(StubHandler.calls) == 1:
             result = {
                 "content": [{"type": "text", "text": "Rate limit reached. wait about 1s and try again."}],
@@ -238,10 +247,15 @@ class StubHandler(BaseHTTPRequestHandler):
             result = {"content": [{"type": "text", "text": "**SIXTA schema-change analysis**"}], "structuredContent": SCHEMA_STRUCT}
         else:
             result = {"content": [{"type": "text", "text": "**SIXTA query analysis**"}], "structuredContent": QUERY_STRUCT}
-        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
-        self.send_response(200)
+        self._json(200, {"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+    def _json(self, status, body, headers=None):
+        payload = json.dumps(body).encode()
+        self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -286,13 +300,64 @@ def test_client_tool_error_raises(stub_server):
 def test_client_http_401_names_auth_not_unreachable(stub_server):
     StubHandler.behavior = "http_401"
     client = sr.SixtaClient(stub_server, api_key="sk-bad")
-    with pytest.raises(sr.SixtaToolError) as exc:
+    with pytest.raises(sr.SixtaAuthError) as exc:
         client.call("sixta_analyze_query", {"query": "SELECT 1"})
     msg = str(exc.value)
     assert "HTTP 401" in msg
     assert "SIXTA_API_KEY" in msg
     assert "invalid API key" in msg
     assert "unreachable" not in msg
+
+
+def test_client_http_401_with_string_error_body(stub_server):
+    # {"error": "unauthorized"} (a shape some proxies use) must not crash the handler
+    StubHandler.behavior = "http_401_string_error"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    msg = str(exc.value)
+    assert "HTTP 401" in msg and "unauthorized" in msg and "SIXTA_API_KEY" in msg
+
+
+def test_client_http_503_is_connectivity(stub_server):
+    StubHandler.behavior = "http_503"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "HTTP 503" in str(exc.value)
+
+
+def test_client_http_429_retries(stub_server):
+    StubHandler.behavior = "http_429_once"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    result = client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert len(StubHandler.calls) == 2
+    assert result["structuredContent"]["verdict"] == "findings"
+
+
+def test_client_rpc_auth_error_gets_hint(stub_server):
+    StubHandler.behavior = "rpc_auth_error"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "SIXTA_API_KEY" in str(exc.value)
+
+
+def test_http_error_message_survives_truncated_body():
+    class TruncatedBody(io.BytesIO):
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"")
+
+    exc = urllib.error.HTTPError("http://x/mcp", 502, "Bad Gateway", {}, TruncatedBody())
+    assert sr._http_error_message(exc, "http://x/mcp") == "HTTP 502 from http://x/mcp"
+
+
+def test_auth_error_gates_even_when_fail_open(stub_server):
+    StubHandler.behavior = "http_401"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(SystemExit) as exc:
+        sr.analyze_sql(client, "x.py", "CREATE INDEX i ON t (c);", "postgresql", None, {}, "open")
+    assert exc.value.code == 2
 
 
 def test_client_connectivity_error():
