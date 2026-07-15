@@ -50,8 +50,13 @@ def test_extract_migration_java_is_flagged_not_analyzed():
 # Rollback artifacts are not forward changes
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", ["U7__drop_index.sql", "foo.down.sql", "foo.rollback.sql"])
-def test_extract_migration_rollback_artifact_is_flagged_not_analyzed(tmp_path, name):
+@pytest.mark.parametrize("name,forward", [
+    ("U7__drop_index.sql", "V7__add_index.sql"),
+    ("foo.down.sql", "foo.sql"),
+    ("foo.rollback.sql", "foo.sql"),
+])
+def test_extract_migration_rollback_artifact_is_flagged_not_analyzed(tmp_path, name, forward):
+    (tmp_path / forward).write_text("CREATE INDEX i ON t (c);")
     f = tmp_path / name
     f.write_text("DROP INDEX i;")
     sql, manual = sr.extract_migration(str(f), _opts())
@@ -61,9 +66,20 @@ def test_extract_migration_rollback_artifact_is_flagged_not_analyzed(tmp_path, n
     assert finding.severity == "Info"
 
 
+@pytest.mark.parametrize("name", ["Update_prices__2024.sql", "Users__seed.sql", "U7__drop_index.sql", "0001_x.down.sql"])
+def test_unpaired_rollback_lookalikes_are_analyzed_normally(tmp_path, name):
+    """A rollback-shaped NAME is not proof: without the forward companion the
+    file is a normal change (Update_prices__2024.sql matches the U-pattern)."""
+    f = tmp_path / name
+    f.write_text("UPDATE prices SET amount = amount * 1.1;")
+    sql, manual = sr.extract_migration(str(f), _opts())
+    assert "UPDATE prices" in sql and manual is None
+
+
 def test_run_v1_undo_only_changeset_sends_no_extractions(tmp_path):
     """A changed undo file alone must not POST anything (its content is only
     meaningful attached to a forward migration)."""
+    (tmp_path / "V7__add_index.sql").write_text("CREATE INDEX i ON t (c);")
     f = tmp_path / "U7__drop_index.sql"
     f.write_text("DROP TABLE orders;")
 

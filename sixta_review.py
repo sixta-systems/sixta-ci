@@ -582,7 +582,7 @@ def resolve_engine(explicit: Optional[str]) -> str:
     detected = detect_engine()
     if detected:
         info(f"engine auto-detected: {detected} (set --engine / SIXTA_ENGINE to override)")
-    else:
+    elif _spring_files():
         info("engine not configured and not detectable from build/config files; assuming postgresql")
     return detected or "postgresql"
 
@@ -647,6 +647,30 @@ _ROLLBACK_ARTIFACT_DESC = ("SIXTA: rollback artifact (undo script). Not analyzed
 _ROLLBACK_ARTIFACT_SECTION = "_Rollback artifact: feeds the forward migration's rollback audit, not analyzed as a forward change._"
 
 
+def _rollback_artifact_forward_exists(path: str) -> bool:
+    """True when the rollback-named file has the forward migration it undoes
+    sitting next to it: U<version>__*.sql needs a V<version>__*.sql sibling,
+    foo.down.sql / foo.rollback.sql need foo.sql. Without the pair, the
+    rollback naming is treated as coincidence and the file analyzed normally."""
+    base = os.path.basename(path)
+    directory = os.path.dirname(path) or "."
+    um = _FLYWAY_UNDO_RE.match(base)
+    if um:
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return False
+        for name in names:
+            vm = _FLYWAY_VERSIONED_RE.match(name)
+            if vm and vm.group("version") == um.group("version"):
+                return True
+        return False
+    for suffix in _ROLLBACK_SQL_SUFFIXES:
+        if base.endswith(suffix):
+            return os.path.exists(os.path.join(directory, base[: -len(suffix)] + ".sql"))
+    return False
+
+
 def _manual_review(path: str, description: str, check_name: str, section: str) -> tuple["Finding", str]:
     return Finding(path=path, severity="Info", description=description, check_name=check_name), section
 
@@ -675,10 +699,13 @@ def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str
         return "", _manual_review(path, _FLYWAY_JAVA_DESC, "flyway-java-manual-review", _FLYWAY_JAVA_SECTION)
     if path.endswith(".sql"):
         base = os.path.basename(path)
-        if _is_rollback_sql_file(base):
+        if _is_rollback_sql_file(base) and _rollback_artifact_forward_exists(path):
             # An undo script is not a forward change: its content rides on the
             # forward migration's rollback audit (see sql_rollback), so grading
-            # its DROPs as production risk would be a false alarm.
+            # its DROPs as production risk would be a false alarm. Only the
+            # naming convention is not proof enough (Update_prices__2024.sql
+            # matches the Flyway undo pattern): the matching forward migration
+            # must exist, else the file is analyzed as a normal change.
             return "", _manual_review(path, _ROLLBACK_ARTIFACT_DESC, "rollback-artifact", _ROLLBACK_ARTIFACT_SECTION)
         try:
             with open(path, encoding="utf-8") as fh:
@@ -1023,15 +1050,15 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         return reports[path]
 
     for path in files:
-        rep = rep_for(path)
         try:
             extracted = extract_migration(path, opts)
         except RuntimeError as exc:
-            rep.skipped.append(str(exc))
+            rep_for(path).skipped.append(str(exc))
             warn(str(exc))
             continue
         if extracted is None:
-            continue
+            continue  # nothing extractable: no empty report section either
+        rep = rep_for(path)
         sql, manual = extracted
 
         statements = split_statements(sql)
