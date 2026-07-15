@@ -316,6 +316,13 @@ class SixtaClient:
                 req = urllib.request.Request(self.url, data=payload, headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
+                try:
+                    err = json.loads(exc.read().decode())
+                    msg = (err.get("error") or {}).get("message") or f"HTTP {exc.code}"
+                except (ValueError, OSError):
+                    msg = f"HTTP {exc.code}"
+                raise SixtaToolError(msg) from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
                 raise SixtaConnectivityError(f"POST {self.url} failed: {exc}") from exc
 

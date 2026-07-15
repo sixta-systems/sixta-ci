@@ -213,12 +213,22 @@ def test_ddl_groups_hinted_table_gets_own_call():
 
 class StubHandler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit_once | tool_error
+    behavior: str = "ok"  # ok | rate_limit_once | tool_error | http_401
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         StubHandler.calls.append({"body": body, "auth": self.headers.get("authorization")})
         tool = body["params"]["name"]
+        if StubHandler.behavior == "http_401":
+            payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "error": {
+                "code": -32001, "message": "Missing API key. Get a free key at connect.sixta.ai/portal",
+            }}).encode()
+            self.send_response(401)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if StubHandler.behavior == "rate_limit_once" and len(StubHandler.calls) == 1:
             result = {
                 "content": [{"type": "text", "text": "Rate limit reached. wait about 1s and try again."}],
@@ -273,6 +283,13 @@ def test_client_tool_error_raises(stub_server):
     StubHandler.behavior = "tool_error"
     with pytest.raises(sr.SixtaToolError):
         sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
+
+
+def test_client_http_error_surfaces_server_message(stub_server):
+    StubHandler.behavior = "http_401"
+    with pytest.raises(sr.SixtaToolError) as exc:
+        sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "connect.sixta.ai/portal" in str(exc.value)
 
 
 def test_client_connectivity_error():
