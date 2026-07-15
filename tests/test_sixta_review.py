@@ -213,12 +213,20 @@ def test_ddl_groups_hinted_table_gets_own_call():
 
 class StubHandler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit_once | tool_error
+    behavior: str = "ok"  # ok | rate_limit_once | tool_error | http_401
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         StubHandler.calls.append({"body": body, "auth": self.headers.get("authorization")})
         tool = body["params"]["name"]
+        if StubHandler.behavior == "http_401":
+            payload = json.dumps({"error": {"code": "unauthorized", "message": "invalid API key"}}).encode()
+            self.send_response(401)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if StubHandler.behavior == "rate_limit_once" and len(StubHandler.calls) == 1:
             result = {
                 "content": [{"type": "text", "text": "Rate limit reached. wait about 1s and try again."}],
@@ -273,6 +281,18 @@ def test_client_tool_error_raises(stub_server):
     StubHandler.behavior = "tool_error"
     with pytest.raises(sr.SixtaToolError):
         sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
+
+
+def test_client_http_401_names_auth_not_unreachable(stub_server):
+    StubHandler.behavior = "http_401"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaToolError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    msg = str(exc.value)
+    assert "HTTP 401" in msg
+    assert "SIXTA_API_KEY" in msg
+    assert "invalid API key" in msg
+    assert "unreachable" not in msg
 
 
 def test_client_connectivity_error():

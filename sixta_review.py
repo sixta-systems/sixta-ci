@@ -316,6 +316,18 @@ class SixtaClient:
                 req = urllib.request.Request(self.url, data=payload, headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
+                try:
+                    err_body = json.loads(exc.read().decode())
+                    detail = (err_body.get("error") or {}).get("message") or ""
+                except (ValueError, OSError):
+                    detail = ""
+                msg = f"HTTP {exc.code} from {self.url}"
+                if detail:
+                    msg += f": {detail}"
+                if exc.code in (401, 403):
+                    msg += " — authentication failed; check SIXTA_API_KEY"
+                raise SixtaToolError(msg) from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
                 raise SixtaConnectivityError(f"POST {self.url} failed: {exc}") from exc
 
