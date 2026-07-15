@@ -127,7 +127,7 @@ def github_server(monkeypatch):
     _GitHubStub.comments = []
     _GitHubStub.calls = []
     server = HTTPServer(("127.0.0.1", 0), _GitHubStub)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     host, port = server.server_address
     monkeypatch.setenv("GITHUB_API_URL", f"http://{host}:{port}")
     monkeypatch.setenv("GITHUB_REPOSITORY", "acme/app")

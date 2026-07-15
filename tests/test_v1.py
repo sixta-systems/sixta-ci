@@ -1,12 +1,12 @@
 """Tests for the /v1/analyze batch mode (stub REST server, no network)."""
 
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
 import sixta_review as sr
+from conftest import json_reply, run_stub_server
 
 
 # --------------------------------------------------------------------------
@@ -78,7 +78,7 @@ def _v1_response(request: dict) -> dict:
 
 class StubV1Handler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit | extraction_error | http_error | http_503
+    behavior: str = "ok"  # ok | rate_limit | extraction_error | http_error | http_401 | http_503 | http_429_once
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers["content-length"]))
@@ -89,8 +89,13 @@ class StubV1Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": {"code": "not_found", "message": "not found"}})
         if StubV1Handler.behavior == "http_error":
             return self._json(413, {"error": {"code": "payload_too_large", "message": "body too big"}})
+        if StubV1Handler.behavior == "http_401":
+            return self._json(401, {"error": {"code": "unauthorized", "message": "invalid API key"}})
         if StubV1Handler.behavior == "http_503":
-            return self._json(503, {"error": {"code": "unavailable", "message": "upstream down"}})
+            return self._json(503, {"error": {"code": "unavailable", "message": "deploy in progress"}})
+        if StubV1Handler.behavior == "http_429_once" and len(StubV1Handler.calls) == 1:
+            return self._json(429, {"error": {"code": "rate_limited", "message": "slow down"}},
+                              headers={"retry-after": "0"})
 
         resp = _v1_response(request)
         if StubV1Handler.behavior == "advisory_worst" and resp["results"]:
@@ -111,13 +116,7 @@ class StubV1Handler(BaseHTTPRequestHandler):
                                    "error": {"code": "invalid_input", "message": "not SQL"}}
         return self._json(200, resp)
 
-    def _json(self, status, body):
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+    _json = json_reply
 
     def log_message(self, *args):
         pass
@@ -125,13 +124,7 @@ class StubV1Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def stub_v1():
-    StubV1Handler.calls = []
-    StubV1Handler.behavior = "ok"
-    server = HTTPServer(("127.0.0.1", 0), StubV1Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}/mcp"  # /mcp base; client derives /v1/analyze
-    server.shutdown()
+    yield from run_stub_server(StubV1Handler)  # /mcp base; client derives /v1/analyze
 
 
 def _opts(**overrides):
@@ -163,11 +156,37 @@ def test_analyze_v1_http_error_raises_tool_error(stub_v1):
     assert "body too big" in str(exc.value)
 
 
-def test_analyze_v1_gateway_error_is_connectivity(stub_v1):
+def test_analyze_v1_http_401_names_auth_and_url(stub_v1):
+    StubV1Handler.behavior = "http_401"
+    client = sr.SixtaClient(stub_v1, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.analyze_v1({"engine": "postgresql", "extractions": [{"kind": "query", "sql": "SELECT 1"}]})
+    msg = str(exc.value)
+    assert "HTTP 401" in msg and "SIXTA_API_KEY" in msg and "/v1/analyze" in msg
+
+
+def test_analyze_v1_http_429_retries(stub_v1):
+    StubV1Handler.behavior = "http_429_once"
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    resp = client.analyze_v1({"engine": "postgresql", "extractions": [{"kind": "query", "sql": "SELECT 1"}]})
+    assert len(StubV1Handler.calls) == 2
+    assert resp["worst_severity"] == "Critical"
+
+
+def test_analyze_v1_http_401_anonymous_is_tool_error(stub_v1):
+    StubV1Handler.behavior = "http_401"
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    with pytest.raises(sr.SixtaToolError) as exc:
+        client.analyze_v1({"engine": "postgresql", "extractions": [{"kind": "query", "sql": "SELECT 1"}]})
+    assert not isinstance(exc.value, sr.SixtaAuthError)
+    assert "set SIXTA_API_KEY" in str(exc.value)
+
+
+def test_analyze_v1_http_5xx_is_connectivity(stub_v1):
     StubV1Handler.behavior = "http_503"
     client = sr.SixtaClient(stub_v1, api_key=None)
     with pytest.raises(sr.SixtaConnectivityError) as exc:
-        client.analyze_v1({"engine": "postgresql", "extractions": []})
+        client.analyze_v1({"engine": "postgresql", "extractions": [{"kind": "query", "sql": "SELECT 1"}]})
     assert "HTTP 503" in str(exc.value)
 
 
@@ -291,6 +310,43 @@ def test_run_v1_batch_connectivity_fail_closed_exits(tmp_path):
 # --------------------------------------------------------------------------
 # main() integration: server-rendered code-quality is preferred
 # --------------------------------------------------------------------------
+
+def test_main_auth_failure_exits_2_and_writes_artifact(stub_v1, tmp_path, monkeypatch):
+    for var in ("DATABASE_URL", "PGHOST", "PGDATABASE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SIXTA_API_KEY", "sk-rotated")
+    monkeypatch.chdir(tmp_path)
+    StubV1Handler.behavior = "http_401"
+    sql = tmp_path / "changes.sql"
+    sql.write_text("UPDATE shop_order SET status='n' WHERE status = NULL;")
+    cq_path = tmp_path / "gl-code-quality-report.json"
+
+    with pytest.raises(SystemExit) as exc:
+        sr.main(["--api", "v1", "--sixta-url", stub_v1, "--fail-mode", "open",
+                 "--report-md", str(tmp_path / "report.md"), "--code-quality", str(cq_path),
+                 str(sql)])
+    assert exc.value.code == 2
+    # The upload step's artifact still exists even though the run gated on auth.
+    assert json.loads(cq_path.read_text()) == []
+    # The report artifact (declared `when: always` in the GitLab template) is
+    # written too, carrying the upsert marker so a stale MR note gets superseded.
+    report = (tmp_path / "report.md").read_text()
+    assert report.startswith(sr.NOTE_MARKER)
+    assert "Analysis did not run" in report and "SIXTA_API_KEY" in report
+
+
+def test_main_auth_failure_local_warns_and_passes(stub_v1, tmp_path, monkeypatch):
+    for var in ("DATABASE_URL", "PGHOST", "PGDATABASE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SIXTA_API_KEY", "sk-rotated")
+    monkeypatch.chdir(tmp_path)
+    StubV1Handler.behavior = "http_401"
+    sql = tmp_path / "changes.sql"
+    sql.write_text("UPDATE shop_order SET status='n' WHERE status = NULL;")
+
+    rc = sr.main(["--api", "v1", "--sixta-url", stub_v1, "--local", str(sql)])
+    assert rc == 0  # a stale local key must not block commits
+
 
 def test_main_v1_prefers_server_code_quality(stub_v1, tmp_path, monkeypatch):
     for var in ("DATABASE_URL", "PGHOST", "PGDATABASE", "SIXTA_BOT_TOKEN"):

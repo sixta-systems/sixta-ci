@@ -42,7 +42,7 @@ jobs:
           engine_version: "16"  # match production — verdicts are version-dependent
           setup: pip install -r requirements.txt
           gate: high            # fail the check on High or Critical findings
-          fail_mode: open       # SIXTA unreachable -> warn and pass
+          fail_mode: open       # SIXTA unreachable -> warn and pass (a rejected configured API key still fails)
           working_directory: example   # demo app lives here; drop in a real repo
       - name: Upload SARIF
         if: always()

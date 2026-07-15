@@ -43,7 +43,7 @@ spec:
     fail_mode:
       default: "open"
       options: ["open", "closed"]
-      description: open = SIXTA unreachable -> warn and pass; closed -> fail.
+      description: open = SIXTA unreachable -> warn and pass; closed -> fail. A rejected configured API key (401/403) always fails, regardless of mode; anonymous runs follow fail_mode.
     allow_failure:
       type: boolean
       default: false
