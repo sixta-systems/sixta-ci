@@ -126,12 +126,14 @@ fixture) · CI snippets in the README and on `/ci` · landing "supported" copy
 only when the tag is cut.
 
 ## Effort summary
-| Phase | Scope | Estimate |
-|---|---|---|
-| S1 | Flyway conventions + init scripts + engine detection | 3–5 days |
-| S2 | Liquibase (offline render + formatted SQL) | ~1 week |
-| S3 | Java-embedded SQL + MyBatis | 2–3 weeks, sliceable |
-| S4 | ddl-auto detection + docs | 1–2 days |
+| Phase | Scope | Estimate | Status |
+|---|---|---|---|
+| S1 | Flyway conventions + init scripts + engine detection | 3–5 days | **implemented — PR #2** |
+| S2 | Liquibase (offline render + formatted SQL) | ~1 week | **implemented — PR #3** |
+| S3 | Java-embedded SQL + MyBatis | 2–3 weeks, sliceable | **implemented — PR #4** |
+| S4 | ddl-auto detection + docs | 1–2 days | **implemented — PR #5** |
+
+Merge order: #2 → #3 → #4 → #5 (stacked). Released to users at the next tag.
 
 S1 alone is a truthful "Spring Boot (Flyway) supported" release in under a
 week. S1+S2 covers essentially every Spring repo that has reviewable DDL.
