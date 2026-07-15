@@ -145,6 +145,15 @@ Flyway conventions:
   that only `include`s others is never rendered: leaf changelogs are analyzed
   when they themselves change.
 
+**JPA `ddl-auto` repos** get told what CI cannot see: when
+`spring.jpa.hibernate.ddl-auto` is `create`/`update`/`create-drop` and no
+migration tool is present, Hibernate mutates the schema at boot and schema
+changes never appear in a PR as SQL. The kit logs this on every run and adds an
+informational finding when it analyzed other files. The fix is one line
+(`spring.jpa.properties.jakarta.persistence.schema-generation.scripts.action=create`
+makes Hibernate emit a DDL script the kit picks up) or, better, adopting
+Flyway/Liquibase.
+
 **SQL inside application code** is reviewed too (no other migration linter does
 this): when a changed `.java` file or MyBatis mapper carries native SQL, the kit
 extracts and analyzes it as queries.
