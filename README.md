@@ -1,11 +1,12 @@
 # sixta-ci
 
-**DBRE-grade SQL review for Django and Alembic migrations and `.sql` files, in
-your GitLab merge requests and GitHub pull requests.**
+**DBRE-grade SQL review for Django, Alembic, and Flyway (Spring Boot) migrations
+and `.sql` files, in your GitLab merge requests and GitHub pull requests.**
 
 When an MR/PR adds or changes a migration (or a `.sql` file), the CI kit renders
 it to SQL (Django via `manage.py sqlmigrate`, Alembic via offline
-`alembic upgrade --sql`, and `.sql` files read directly), sends DDL to
+`alembic upgrade --sql`, Flyway and other `.sql` files read directly with
+Flyway `${placeholder}` substitution), sends DDL to
 [SIXTA Connect](https://sixta.ai)'s `sixta_analyze_schema_change` and DML to
 `sixta_analyze_query`, and reports back:
 
@@ -105,6 +106,35 @@ Django's `RunPython`.
 Self-hosted runners need outbound HTTPS to `connect.sixta.ai` and
 `raw.githubusercontent.com`.
 
+## Spring Boot / Flyway
+
+Flyway migrations are plain `.sql` files, so a Spring Boot repo needs no
+database, no JVM, and no `setup` input. The kit reads the changed files (any
+location works: discovery is diff-driven, not directory-driven) and applies the
+Flyway conventions:
+
+- **Versioned (`V2__add_index.sql`) and repeatable (`R__views.sql`)** migrations
+  are analyzed as schema changes.
+- **`${placeholder}` tokens** are substituted before analysis: values come from
+  `spring.flyway.placeholders.*` in `application.properties` or
+  `application.yml` when present (`.yml` parsing needs PyYAML), else the
+  placeholder's own name stands in.
+- **Undo files (`U2__drop_index.sql`**, and generic `*.down.sql` /
+  `*.rollback.sql` companions**)** feed the rollback audit of their forward
+  migration and are no longer analyzed as forward changes themselves.
+- **Java-based migrations** (`**/db/migration/**/V3__Backfill.java`) render no
+  SQL offline and are flagged for human review, like Django's `RunPython`.
+- **The engine is auto-detected** when `engine` is `auto` (the default): the
+  Flyway per-DB module (`flyway-database-postgresql` / `flyway-mysql`), the
+  JDBC driver artifact, or the datasource URL in `pom.xml`, `build.gradle`, or
+  `application.*` names it. Fallback: postgresql.
+
+On GitHub, trigger the workflow with
+`paths: ["**/db/migration/**", "**/*.sql"]` and skip the `postgres` service,
+`DATABASE_URL`, and `setup` entirely. Liquibase XML/YAML changelogs are not yet
+rendered (planned: see `docs/spring-boot-support.md`); SQL-formatted changelogs
+work today as plain `.sql` files.
+
 ## How it works
 
 ```
@@ -145,7 +175,8 @@ reverse SQL):
 - **Plain `.sql` / Flyway**: companion undo file check. `V<version>__name.sql`
   looks for `U<version>__*.sql` in the same directory; a bare `foo.sql` looks
   for `foo.rollback.sql` or `foo.down.sql`. The companion's contents are
-  attached; no companion means `missing`.
+  attached; no companion means `missing`. Repeatable migrations (`R__*.sql`)
+  skip the audit: their rollback is the previous version of the file.
 
 The server analyzes an attached rollback like any other migration (a rollback
 that is itself a lock bomb gets flagged before the incident, not during it) and
@@ -166,7 +197,7 @@ Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
 
 | Input | Default | Notes |
 |---|---|---|
-| `engine` / `engine_version` | `postgresql` / none | **Set the version to match production.** |
+| `engine` / `engine_version` | `auto` / none | `auto` detects from build/config files, falling back to postgresql. **Set the version to match production.** |
 | `gate` | `high` | Fail at ≥ this severity: `critical`, `high`, `medium`, `low`, `none`. |
 | `fail_mode` | `open` | SIXTA unreachable → `open`: warn & pass; `closed`: fail. Findings always gate. |
 | `api` | `v1` (GitHub) / `mcp` (GitLab) | `v1` batches the whole run into one `POST /v1/analyze`. |
@@ -215,6 +246,9 @@ migration, a plain `CREATE INDEX` (blocks writes; SIXTA suggests
 [.gitlab-ci.yml](example/.gitlab-ci.yml) and
 [.github/workflows/sixta.yml](example/.github/workflows/sixta.yml) are the
 consumer setups for each platform.
+[`example/spring-flyway/`](example/spring-flyway/) is the Spring Boot
+equivalent: Flyway versioned/repeatable/undo migrations with a `${placeholder}`,
+plus a Java-based migration that triggers the manual-review flag.
 
 ## Development
 
