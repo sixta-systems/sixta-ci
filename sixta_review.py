@@ -52,7 +52,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 DEFAULT_SIXTA_URL = "https://connect.sixta.ai/mcp"
 REPORT_MD = "sixta-report.md"
