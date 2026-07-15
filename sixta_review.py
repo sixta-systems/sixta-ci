@@ -2170,7 +2170,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     api_key = os.environ.get("SIXTA_API_KEY")
     if not api_key:
-        warn("SIXTA_API_KEY not set — calling anonymously (tight rate limits; get a free key at connect.sixta.ai/portal)")
+        warn("SIXTA_API_KEY not set. The hosted connect.sixta.ai requires a key and will return 401 (get a free one in about 30 seconds at connect.sixta.ai/portal); anonymous calls only work against self-hosted servers with anonymous access enabled.")
 
     files = changed_files(opts.base_sha, opts.local, opts.files)
     if not files:

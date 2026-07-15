@@ -6,7 +6,7 @@ branding:
   color: "green"
 
 # Required env (set from secrets in your workflow):
-#   SIXTA_API_KEY    free key from connect.sixta.ai/portal (works anonymously with tight limits if unset)
+#   SIXTA_API_KEY    free key from connect.sixta.ai/portal (required: the hosted endpoint rejects anonymous calls; unset only works against self-hosted servers with anonymous access enabled)
 #   GITHUB_TOKEN     provided automatically; needs `pull-requests: write` for the PR comment
 #
 # The calling job must checkout with fetch-depth: 0 (the review diffs against the
