@@ -43,6 +43,9 @@ inputs:
   alembic_config:
     description: "Alembic config for offline SQL render (alembic upgrade --sql). No database needed."
     default: "alembic.ini"
+  liquibase_cmd:
+    description: "Liquibase CLI for offline changelog rendering (update-sql). Install it via `setup` when using XML/YAML/JSON changelogs; SQL-format changelogs need no CLI."
+    default: "liquibase"
   working_directory:
     description: "Directory to run the review in (where manage.py lives). Set for a monorepo with the Django app in a subdirectory."
     default: "."
@@ -87,6 +90,7 @@ runs:
         SIXTA_URL: ${{ inputs.sixta_url }}
         SIXTA_MANAGE_PY: ${{ inputs.manage_py }}
         SIXTA_ALEMBIC_CONFIG: ${{ inputs.alembic_config }}
+        SIXTA_LIQUIBASE_CMD: ${{ inputs.liquibase_cmd }}
         SIXTA_SARIF: ${{ inputs.sarif }}
       run: |
         curl -fsSL "https://raw.githubusercontent.com/sixta-systems/sixta-ci/${{ inputs.script_ref }}/sixta_review.py" -o "${RUNNER_TEMP}/sixta_review.py"

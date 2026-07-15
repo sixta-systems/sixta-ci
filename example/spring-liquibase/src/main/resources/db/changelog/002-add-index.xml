@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- XML leaf changelog: rendered offline via `liquibase update-sql` when it
+     changes (needs the Liquibase CLI in the job; no database). -->
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+  <changeSet id="3" author="ewen">
+    <createIndex tableName="orders" indexName="idx_orders_customer">
+      <column name="customer_id"/>
+    </createIndex>
+  </changeSet>
+</databaseChangeLog>

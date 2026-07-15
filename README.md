@@ -106,7 +106,7 @@ Django's `RunPython`.
 Self-hosted runners need outbound HTTPS to `connect.sixta.ai` and
 `raw.githubusercontent.com`.
 
-## Spring Boot / Flyway
+## Spring Boot: Flyway and Liquibase
 
 Flyway migrations are plain `.sql` files, so a Spring Boot repo needs no
 database, no JVM, and no `setup` input. The kit reads the changed files (any
@@ -129,11 +129,26 @@ Flyway conventions:
   JDBC driver artifact, or the datasource URL in `pom.xml`, `build.gradle`, or
   `application.*` names it. Fallback: postgresql.
 
+**Liquibase** is supported in both changelog styles:
+
+- **SQL-format changelogs** (`--liquibase formatted sql`) are parsed statically:
+  no CLI and no database needed. Only changesets that are **new or edited vs
+  the MR/PR base** are analyzed (changelogs are append-mostly, so old
+  changesets are never re-graded), `--property` values substitute `${...}`,
+  and inline `--rollback` SQL feeds the rollback audit. A new changeset without
+  `--rollback` reports the change as `missing` a rollback.
+- **XML/YAML/JSON changelogs** are rendered offline via the Liquibase CLI
+  (`update-sql` against an `offline:<engine>` URL, no database). Install the
+  CLI in the job (via `setup`) and point `liquibase_cmd` at it if it is not on
+  `PATH`; without the CLI these files are reported as skipped, never silently
+  passed. The rollback audit renders `future-rollback-sql`. A master changelog
+  that only `include`s others is never rendered: leaf changelogs are analyzed
+  when they themselves change.
+
 On GitHub, trigger the workflow with
-`paths: ["**/db/migration/**", "**/*.sql"]` and skip the `postgres` service,
-`DATABASE_URL`, and `setup` entirely. Liquibase XML/YAML changelogs are not yet
-rendered (planned: see `docs/spring-boot-support.md`); SQL-formatted changelogs
-work today as plain `.sql` files.
+`paths: ["**/db/migration/**", "**/db/changelog/**", "**/*.sql"]` and skip the
+`postgres` service, `DATABASE_URL`, and (for Flyway or SQL-format Liquibase)
+the `setup` input entirely.
 
 ## How it works
 
@@ -249,6 +264,9 @@ consumer setups for each platform.
 [`example/spring-flyway/`](example/spring-flyway/) is the Spring Boot
 equivalent: Flyway versioned/repeatable/undo migrations with a `${placeholder}`,
 plus a Java-based migration that triggers the manual-review flag.
+[`example/spring-liquibase/`](example/spring-liquibase/) shows both Liquibase
+styles: a formatted-SQL changelog (with `--property` and `--rollback`) and an
+XML leaf behind a master index.
 
 ## Development
 

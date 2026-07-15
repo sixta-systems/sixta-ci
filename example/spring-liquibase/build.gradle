@@ -1,0 +1,7 @@
+// Minimal fixture: enough for sixta-review's engine auto-detection
+// (org.postgresql driver). Not a buildable project.
+dependencies {
+    implementation "org.springframework.boot:spring-boot-starter-liquibase"
+    implementation "org.liquibase:liquibase-core"
+    runtimeOnly "org.postgresql:postgresql"
+}

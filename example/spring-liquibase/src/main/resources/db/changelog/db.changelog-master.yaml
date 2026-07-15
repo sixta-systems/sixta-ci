@@ -1,0 +1,7 @@
+# Changelog index: never rendered by sixta-review (the included changelogs are
+# analyzed when they themselves change).
+databaseChangeLog:
+  - include:
+      file: db/changelog/001-init.sql
+  - include:
+      file: db/changelog/002-add-index.xml
