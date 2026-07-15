@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+import threading
+from http.server import HTTPServer
 
 import pytest
 
@@ -33,3 +35,18 @@ def json_reply(handler, status, body, headers=None):
         handler.send_header(name, value)
     handler.end_headers()
     handler.wfile.write(payload)
+
+
+def run_stub_server(handler_cls):
+    """Shared stub-server lifecycle for fixtures (`yield from run_stub_server(H)`):
+    reset class state, serve on an ephemeral port, yield the /mcp URL. The short
+    poll_interval keeps shutdown() from idling 0.5s per test."""
+    handler_cls.calls = []
+    handler_cls.behavior = "ok"
+    server = HTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/mcp"
+    finally:
+        server.shutdown()

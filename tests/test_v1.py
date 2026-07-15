@@ -1,13 +1,12 @@
 """Tests for the /v1/analyze batch mode (stub REST server, no network)."""
 
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
 import sixta_review as sr
-from conftest import json_reply
+from conftest import json_reply, run_stub_server
 
 
 # --------------------------------------------------------------------------
@@ -117,8 +116,7 @@ class StubV1Handler(BaseHTTPRequestHandler):
                                    "error": {"code": "invalid_input", "message": "not SQL"}}
         return self._json(200, resp)
 
-    def _json(self, status, body, headers=None):
-        json_reply(self, status, body, headers)
+    _json = json_reply
 
     def log_message(self, *args):
         pass
@@ -126,13 +124,7 @@ class StubV1Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def stub_v1():
-    StubV1Handler.calls = []
-    StubV1Handler.behavior = "ok"
-    server = HTTPServer(("127.0.0.1", 0), StubV1Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}/mcp"  # /mcp base; client derives /v1/analyze
-    server.shutdown()
+    yield from run_stub_server(StubV1Handler)  # /mcp base; client derives /v1/analyze
 
 
 def _opts(**overrides):
@@ -336,6 +328,11 @@ def test_main_auth_failure_exits_2_and_writes_artifact(stub_v1, tmp_path, monkey
     assert exc.value.code == 2
     # The upload step's artifact still exists even though the run gated on auth.
     assert json.loads(cq_path.read_text()) == []
+    # The report artifact (declared `when: always` in the GitLab template) is
+    # written too, carrying the upsert marker so a stale MR note gets superseded.
+    report = (tmp_path / "report.md").read_text()
+    assert report.startswith(sr.NOTE_MARKER)
+    assert "Analysis did not run" in report and "SIXTA_API_KEY" in report
 
 
 def test_main_auth_failure_local_warns_and_passes(stub_v1, tmp_path, monkeypatch):

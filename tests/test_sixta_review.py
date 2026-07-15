@@ -3,14 +3,13 @@
 import http.client
 import io
 import json
-import threading
 import urllib.error
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
 import sixta_review as sr
-from conftest import json_reply
+from conftest import json_reply, run_stub_server
 
 
 # --------------------------------------------------------------------------
@@ -217,7 +216,7 @@ def test_ddl_groups_hinted_table_gets_own_call():
 
 class StubHandler(BaseHTTPRequestHandler):
     calls: list = []
-    # ok | rate_limit_once | tool_error | http_401 | http_401_string_error
+    # ok | rate_limit_once | tool_error | tool_error_auth | http_401 | http_401_string_error
     # | http_503 | http_429_once | rpc_auth_error | rpc_null_message | rpc_rate_limit_once
     behavior: str = "ok"
 
@@ -250,14 +249,15 @@ class StubHandler(BaseHTTPRequestHandler):
             }
         elif StubHandler.behavior == "tool_error":
             result = {"content": [{"type": "text", "text": "boom"}], "isError": True}
+        elif StubHandler.behavior == "tool_error_auth":
+            result = {"content": [{"type": "text", "text": "Unauthorized: invalid API key"}], "isError": True}
         elif tool == "sixta_analyze_schema_change":
             result = {"content": [{"type": "text", "text": "**SIXTA schema-change analysis**"}], "structuredContent": SCHEMA_STRUCT}
         else:
             result = {"content": [{"type": "text", "text": "**SIXTA query analysis**"}], "structuredContent": QUERY_STRUCT}
         self._json(200, {"jsonrpc": "2.0", "id": body["id"], "result": result})
 
-    def _json(self, status, body, headers=None):
-        json_reply(self, status, body, headers)
+    _json = json_reply
 
     def log_message(self, *args):  # silence
         pass
@@ -265,13 +265,7 @@ class StubHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def stub_server():
-    StubHandler.calls = []
-    StubHandler.behavior = "ok"
-    server = HTTPServer(("127.0.0.1", 0), StubHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}/mcp"
-    server.shutdown()
+    yield from run_stub_server(StubHandler)
 
 
 def test_client_sends_bearer_and_bare_tools_call(stub_server):
@@ -345,15 +339,42 @@ def test_client_http_401_anonymous_is_tool_error_not_auth(stub_server):
     assert "set SIXTA_API_KEY" in str(exc.value)
 
 
-def test_client_rpc_auth_error_gets_hint_but_stays_tool_error(stub_server):
-    # Message heuristics decorate only — a JSON-RPC error mentioning the key
-    # must never hard-fail a fail-open run (quota nudges also say "API key").
+def test_client_rpc_auth_rejection_with_key_is_auth_error(stub_server):
+    # An unambiguous rejection ("Unauthorized: invalid API key") of a
+    # configured key gates even when it arrives as a 200 JSON-RPC error.
     StubHandler.behavior = "rpc_auth_error"
     client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "SIXTA_API_KEY" in str(exc.value)
+
+
+def test_client_rpc_auth_flavored_anonymous_stays_tool_error(stub_server):
+    # Without a configured key there is nothing to rotate: fail-open applies.
+    StubHandler.behavior = "rpc_auth_error"
+    client = sr.SixtaClient(stub_server, api_key=None)
     with pytest.raises(sr.SixtaToolError) as exc:
         client.call("sixta_analyze_query", {"query": "SELECT 1"})
     assert not isinstance(exc.value, sr.SixtaAuthError)
     assert "SIXTA_API_KEY" in str(exc.value)
+
+
+def test_client_iserror_auth_rejection_with_key_is_auth_error(stub_server):
+    StubHandler.behavior = "tool_error_auth"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError):
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+
+
+def test_hint_decoration_is_tentative_and_gate_matcher_is_strict():
+    # Broad matcher decorates with a conditional hint, never a definitive claim
+    decorated = sr._hint_if_auth("Statement type forbidden by policy: DROP DATABASE")
+    assert "if this is an authentication problem" in decorated
+    assert "authentication failed" not in decorated
+    # The gate matcher must not fire on policy verdicts or quota nudges
+    assert not sr._is_auth_rejection("Statement type forbidden by policy: DROP DATABASE")
+    assert not sr._is_auth_rejection("your API key has exceeded its monthly quota")
+    assert sr._is_auth_rejection("Unauthorized: invalid API key")
 
 
 def test_client_rpc_error_null_message_does_not_crash(stub_server):
@@ -393,6 +414,25 @@ def test_retry_after_header_parses_seconds_dates_and_garbage():
 def test_redact_url_strips_credentials_and_query():
     assert sr._redact_url("https://user:secret@sixta.corp:8443/mcp?token=abc#f") == \
         "https://sixta.corp:8443/mcp"
+    assert sr._redact_url("http://[::1]:8080/mcp") == "http://[::1]:8080/mcp"
+
+
+def test_connectivity_error_redacts_url_credentials():
+    client = sr.SixtaClient("http://user:secret@127.0.0.1:1/mcp", api_key=None, timeout=1)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "secret" not in str(exc.value)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.analyze_v1({"engine": "postgresql", "extractions": []})
+    assert "secret" not in str(exc.value)
+
+
+def test_client_http_429_exhausted_says_rate_limited(stub_server):
+    StubHandler.behavior = "http_429_once"
+    client = sr.SixtaClient(stub_server, api_key=None, max_retries=0)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "rate limited" in str(exc.value) and "HTTP 429" in str(exc.value)
 
 
 def test_auth_error_propagates_for_main_to_decide(stub_server):
