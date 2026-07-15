@@ -742,14 +742,31 @@ def parse_formatted_changelog(text: str) -> list[LiquibaseChangeset]:
     return changesets
 
 
+def _diff_base_ref(opts: argparse.Namespace) -> Optional[str]:
+    return getattr(opts, "base_sha", None) or ("HEAD" if getattr(opts, "local", False) else None)
+
+
+def _repo_relative(path: str) -> str:
+    """git show needs a repo-relative path; explicit CLI args may be absolute."""
+    if not os.path.isabs(path):
+        return path
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return os.path.relpath(path, proc.stdout.strip())
+    except OSError:
+        pass
+    return path
+
+
 def _file_at_diff_base(path: str, opts: argparse.Namespace) -> Optional[str]:
     """The file's content at the diff base (CI: --base-sha; local: HEAD).
     None when there is no base or the file did not exist there."""
-    ref = getattr(opts, "base_sha", None) or ("HEAD" if getattr(opts, "local", False) else None)
+    ref = _diff_base_ref(opts)
     if not ref:
         return None
     try:
-        proc = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True, text=True)
+        proc = subprocess.run(["git", "show", f"{ref}:{_repo_relative(path)}"], capture_output=True, text=True)
     except OSError:
         return None
     return proc.stdout if proc.returncode == 0 else None
@@ -783,6 +800,12 @@ def liquibase_formatted_rollback(path: str, opts: argparse.Namespace) -> Optiona
     is unchecked rather than sending empty SQL."""
     text = _read_small(path)
     if text is None:
+        return None
+    if _diff_base_ref(opts) is None:
+        # No usable diff base: every changeset would look new, and one old
+        # changeset without --rollback would wrongly report the whole change
+        # as missing. Leave the audit unchecked instead of guessing.
+        info(f"rollback: {path}: no diff base to separate new changesets — rollback unchecked")
         return None
     new = new_formatted_changesets(path, text, opts)
     if not new:

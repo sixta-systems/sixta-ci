@@ -141,7 +141,7 @@ Flyway conventions:
   (`update-sql` against an `offline:<engine>` URL, no database). Install the
   CLI in the job (via `setup`) and point `liquibase_cmd` at it if it is not on
   `PATH`; without the CLI these files are reported as skipped, never silently
-  passed. The rollback audit renders `future-rollback-sql`. A master changelog
+  passed. The rollback audit marks the changesets executed in a throwaway offline state and renders `rollback-count-sql` (offline `future-rollback-sql` produces nothing). A master changelog
   that only `include`s others is never rendered: leaf changelogs are analyzed
   when they themselves change.
 

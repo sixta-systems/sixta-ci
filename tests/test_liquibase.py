@@ -117,11 +117,35 @@ def test_extract_migration_formatted_no_new_changesets_skips(tmp_path, monkeypat
 # Formatted-SQL rollback audit
 # --------------------------------------------------------------------------
 
+def test_formatted_rollback_without_diff_base_is_unchecked(tmp_path):
+    """No usable base means every changeset looks new; one pre-existing
+    changeset without --rollback must not fail the whole change as missing."""
+    f = tmp_path / "changelog.sql"
+    f.write_text(FORMATTED + FORMATTED_NO_ROLLBACK.split("sql\n", 1)[1])
+    assert sr.liquibase_formatted_rollback(str(f), _opts()) is None
+
+
+def test_file_at_diff_base_handles_absolute_paths(tmp_path, monkeypatch):
+    """Explicit CLI args may be absolute; git show needs repo-relative."""
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        if cmd[:2] == ["git", "rev-parse"]:
+            return types.SimpleNamespace(returncode=0, stdout="/repo\n", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout="--liquibase formatted sql\n", stderr="")
+
+    monkeypatch.setattr(sr.subprocess, "run", fake_run)
+    out = sr._file_at_diff_base("/repo/db/changelog.sql", _opts(base_sha="abc123"))
+    assert out.startswith("--liquibase")
+    assert seen["cmd"][-1] == "abc123:db/changelog.sql"
+
+
 def test_formatted_rollback_reversed_order(tmp_path, monkeypatch):
     f = tmp_path / "changelog.sql"
     f.write_text(FORMATTED)
     monkeypatch.setattr(sr, "_file_at_diff_base", lambda path, opts: None)
-    rb = sr.liquibase_formatted_rollback(str(f), _opts())
+    rb = sr.liquibase_formatted_rollback(str(f), _opts(base_sha="abc123"))
     assert rb["sql"].index("DROP INDEX") < rb["sql"].index("DROP TABLE")
 
 
@@ -129,14 +153,14 @@ def test_formatted_rollback_missing_when_any_changeset_lacks_it(tmp_path, monkey
     f = tmp_path / "changelog.sql"
     f.write_text(FORMATTED + FORMATTED_NO_ROLLBACK.split("sql\n", 1)[1])
     monkeypatch.setattr(sr, "_file_at_diff_base", lambda path, opts: None)
-    assert sr.liquibase_formatted_rollback(str(f), _opts()) == {"status": "missing"}
+    assert sr.liquibase_formatted_rollback(str(f), _opts(base_sha="abc123")) == {"status": "missing"}
 
 
 def test_formatted_rollback_all_empty_is_unchecked(tmp_path, monkeypatch):
     f = tmp_path / "changelog.sql"
     f.write_text(FORMATTED_EMPTY_ROLLBACK)
     monkeypatch.setattr(sr, "_file_at_diff_base", lambda path, opts: None)
-    assert sr.liquibase_formatted_rollback(str(f), _opts()) is None
+    assert sr.liquibase_formatted_rollback(str(f), _opts(base_sha="abc123")) is None
 
 
 # --------------------------------------------------------------------------
@@ -295,7 +319,7 @@ def test_extract_rollback_routes_formatted_changelog(tmp_path, monkeypatch):
         raise AssertionError("formatted changelogs are parsed, not rendered")
 
     monkeypatch.setattr(sr.subprocess, "run", no_subprocess)
-    rb = sr.extract_rollback(str(f), _opts())
+    rb = sr.extract_rollback(str(f), _opts(base_sha="abc123"))
     assert "DROP INDEX" in rb["sql"]
 
 
