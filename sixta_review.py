@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import email.utils
 import hashlib
 import http.client
 import json
@@ -51,7 +52,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import NoReturn, Optional
 
 __version__ = "0.4.1"
 
@@ -261,6 +263,110 @@ class SixtaToolError(Exception):
     pass
 
 
+class SixtaAuthError(Exception):
+    """A configured API key was rejected (HTTP 401/403 with a Bearer header
+    sent). A persistent misconfiguration, not a transient outage — deliberately
+    NOT a SixtaToolError subclass so no fail-open catch site can swallow it;
+    main() decides once (CI gates, local pre-commit warns)."""
+
+
+_AUTH_HINT = " — authentication failed; check SIXTA_API_KEY"
+_AUTH_MAYBE_HINT = " — if this is an authentication problem, check SIXTA_API_KEY"
+
+RETRY_AFTER_DEFAULT_S = 30
+RETRY_AFTER_CAP_S = 120
+
+
+def _redact_url(url: str) -> str:
+    """Scheme+host+path only — error messages land verbatim in PR/MR comments,
+    so credentials or routing tokens in the configured URL must not leak."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:  # IPv6 literal — hostname strips the brackets urlsplit needs
+        host = f"[{host}]"
+    if parts.port:
+        host += f":{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def _http_error_message(exc: urllib.error.HTTPError, url: str) -> str:
+    """Human-readable message for an HTTP error response. The JSON error body
+    is best-effort context only — no body shape or read failure may mask the
+    status code."""
+    detail = ""
+    try:
+        err_body = json.loads(exc.read().decode())
+        err = err_body.get("error") if isinstance(err_body, dict) else None
+        if isinstance(err, dict):
+            raw = err.get("message")
+            detail = "" if raw is None else str(raw)
+        elif isinstance(err, str):
+            detail = err
+    except Exception:  # e.g. IncompleteRead, non-JSON body, wrong charset
+        detail = ""
+    msg = f"HTTP {exc.code} from {_redact_url(url)}"
+    if detail:
+        msg += f": {detail}"
+    return msg
+
+
+def _raise_http_error(exc: urllib.error.HTTPError, url: str, authenticated: bool) -> NoReturn:
+    """Classify an HTTP error response. 401/403 with a configured key is an
+    auth misconfiguration (gates in CI regardless of --fail-mode); anonymous
+    401/403 is a tool error so fail-open still applies (fork PRs run without
+    secrets). 5xx and post-retry 429 are transient — the "SIXTA unreachable"
+    class the fail-mode docs describe. Any other 4xx is a tool error."""
+    msg = _http_error_message(exc, url)
+    if exc.code in (401, 403):
+        if authenticated:
+            raise SixtaAuthError(msg + _AUTH_HINT) from exc
+        raise SixtaToolError(msg + " — anonymous call rejected; set SIXTA_API_KEY") from exc
+    if exc.code == 429:
+        raise SixtaConnectivityError(f"rate limited, retries exhausted: {msg}") from exc
+    if exc.code < 400 or exc.code >= 500:
+        # < 400: an unfollowed redirect (urllib refuses to re-POST a body on
+        # 3xx) — the service never handled the request, same as 5xx.
+        raise SixtaConnectivityError(msg) from exc
+    raise SixtaToolError(msg) from exc
+
+
+def _looks_like_auth_error(text: str) -> bool:
+    t = text.lower()
+    return any(marker in t for marker in ("unauthorized", "forbidden", "api key", "authentication"))
+
+
+def _is_auth_rejection(text: str) -> bool:
+    """Unambiguous auth-rejection wording, safe to gate on (unlike the broad
+    _looks_like_auth_error, which only decorates): a quota nudge mentioning
+    "API key" or a "forbidden by policy" verdict must not match."""
+    t = text.lower()
+    return any(marker in t for marker in ("unauthorized", "invalid api key", "api key expired",
+                                          "expired api key", "invalid credentials"))
+
+
+def _hint_if_auth(msg: str) -> str:
+    """Append a *conditional* SIXTA_API_KEY hint to auth-flavored error text.
+    The broad heuristic only decorates — it never upgrades an error to
+    SixtaAuthError, and the wording stays tentative because messages like
+    "forbidden by policy" match without being auth failures."""
+    return msg + _AUTH_MAYBE_HINT if _looks_like_auth_error(msg) else msg
+
+
+def _retry_after_header_seconds(value: Optional[str], default: int = RETRY_AFTER_DEFAULT_S) -> int:
+    """Parse a Retry-After header: delta-seconds or HTTP-date (RFC 9110)."""
+    if not value:
+        return default
+    try:
+        n = int(value)
+    except ValueError:
+        try:
+            dt = email.utils.parsedate_to_datetime(value)
+            n = int((dt - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            return default
+    return min(max(n, 0), RETRY_AFTER_CAP_S)
+
+
 def v1_endpoint(mcp_url: str) -> str:
     """Derive the /v1/analyze URL from a configured /mcp URL."""
     if mcp_url.endswith("/mcp"):
@@ -283,14 +389,10 @@ class SixtaClient:
         """POST a batch to /v1/analyze and return the parsed JSON response.
 
         The route always answers 200 for a well-formed batch (per-extraction
-        rate-limit/errors ride inside ``results``); a 4xx/5xx carries a REST
-        error body ``{error: {code, message}}`` and becomes a SixtaToolError,
-        while transport failures — including gateway errors and unfollowed
-        redirects, see ``_http_error`` — become a SixtaConnectivityError.
-        The exception is HTTP 429 (a gateway enforcing rate limits before the
-        route can answer 200): that is backed off and retried like the MCP
-        path, since under --fail-mode=closed it would otherwise fail the run
-        on a transient condition."""
+        rate-limit/errors ride inside ``results``). HTTP 429 from a fronting
+        proxy is retried with bounded backoff, like the mcp path; every other
+        HTTP error status is classified by ``_raise_http_error``, and pure
+        transport failures become a SixtaConnectivityError."""
         payload = json.dumps(request).encode()
         headers = {"content-type": "application/json"}
         if self.api_key:
@@ -303,14 +405,21 @@ class SixtaClient:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
-                if exc.code == 429 and attempt <= self.max_retries:
-                    wait = _retry_after_http(exc)
-                    warn(f"rate limited on /v1/analyze (HTTP 429); backing off {wait}s (attempt {attempt}/{self.max_retries})")
-                    time.sleep(wait)
+                if self._backoff_429(exc, "/v1/analyze", attempt):
                     continue
-                raise _http_error(exc, self.v1_url) from exc
+                _raise_http_error(exc, self.v1_url, authenticated=bool(self.api_key))
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-                raise SixtaConnectivityError(f"POST {self.v1_url} failed: {exc}") from exc
+                raise SixtaConnectivityError(f"POST {_redact_url(self.v1_url)} failed: {exc}") from exc
+
+    def _backoff_429(self, exc: urllib.error.HTTPError, label: str, attempt: int) -> bool:
+        """Bounded backoff for an HTTP 429; True means the caller should retry."""
+        if exc.code != 429 or attempt > self.max_retries:
+            return False
+        wait = _retry_after_header_seconds(exc.headers.get("retry-after"))
+        exc.close()  # release the socket before sleeping
+        warn(f"rate limited (HTTP 429) on {label}; backing off {wait}s (attempt {attempt}/{self.max_retries})")
+        time.sleep(wait)
+        return True
 
     def call(self, tool: str, arguments: dict) -> dict:
         """Return the MCP CallToolResult ({content, structuredContent?, isError?})."""
@@ -330,17 +439,24 @@ class SixtaClient:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode())
             except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
-                if exc.code == 429 and attempt <= self.max_retries:
-                    wait = _retry_after_http(exc)
-                    warn(f"rate limited on {tool} (HTTP 429); backing off {wait}s (attempt {attempt}/{self.max_retries})")
+                if self._backoff_429(exc, tool, attempt):
+                    continue
+                _raise_http_error(exc, self.url, authenticated=bool(self.api_key))
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                raise SixtaConnectivityError(f"POST {_redact_url(self.url)} failed: {exc}") from exc
+
+            if "error" in body:  # JSON-RPC level error (auth, body cap, rate limit, ...)
+                err = body["error"]
+                raw = err.get("message") if isinstance(err, dict) else None
+                msg = raw if isinstance(raw, str) and raw else str(err)
+                if "rate limit" in msg.lower() and attempt <= self.max_retries:
+                    wait = _retry_after_seconds(msg)
+                    warn(f"rate limited on {tool}; backing off {wait}s (attempt {attempt}/{self.max_retries})")
                     time.sleep(wait)
                     continue
-                raise _http_error(exc, self.url) from exc
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-                raise SixtaConnectivityError(f"POST {self.url} failed: {exc}") from exc
-
-            if "error" in body:  # JSON-RPC level error (auth, body cap, ...)
-                raise SixtaToolError(body["error"].get("message", str(body["error"])))
+                if self.api_key and _is_auth_rejection(msg):
+                    raise SixtaAuthError(msg + _AUTH_HINT)
+                raise SixtaToolError(_hint_if_auth(msg))
             result = body.get("result") or {}
             if result.get("isError"):
                 text = _result_text(result)
@@ -349,30 +465,10 @@ class SixtaClient:
                     warn(f"rate limited on {tool}; backing off {wait}s (attempt {attempt}/{self.max_retries})")
                     time.sleep(wait)
                     continue
-                raise SixtaToolError(text)
+                if self.api_key and _is_auth_rejection(text):
+                    raise SixtaAuthError(text + _AUTH_HINT)
+                raise SixtaToolError(_hint_if_auth(text))
             return result
-
-
-def _http_error(exc: urllib.error.HTTPError, url: str) -> Exception:
-    """Classify an HTTP error response from ``url``.
-
-    Unfollowed redirects (urllib refuses to re-POST a body on 3xx) and gateway
-    errors mean the service never handled the request — that's connectivity.
-    Anything else is the server rejecting the call: surface the error body's
-    ``error.message`` when present (the REST and JSON-RPC error envelopes both
-    carry ``{error: {code, message}}``), tolerating any malformed body."""
-    try:
-        body = json.loads(exc.read().decode())
-    except (ValueError, OSError, http.client.HTTPException):
-        body = None
-    error = body.get("error") if isinstance(body, dict) else None
-    msg = error.get("message") if isinstance(error, dict) else None
-    if exc.code < 400 or exc.code in (502, 503, 504):
-        detail = f": {msg}" if msg else ""
-        return SixtaConnectivityError(f"POST {url} failed: HTTP {exc.code}{detail}")
-    if msg:
-        return SixtaToolError(f"{msg} (HTTP {exc.code} from {url})")
-    return SixtaToolError(f"HTTP {exc.code} from {url}")
 
 
 def _result_text(result: dict) -> str:
@@ -382,24 +478,9 @@ def _result_text(result: dict) -> str:
     return ""
 
 
-def _retry_after_seconds(text: str, default: int = 30) -> int:
+def _retry_after_seconds(text: str, default: int = RETRY_AFTER_DEFAULT_S) -> int:
     m = re.search(r"wait about (\d+)s", text)
-    return min(int(m.group(1)) if m else default, 120)
-
-
-def _retry_after_http(exc: urllib.error.HTTPError) -> int:
-    """Backoff for an HTTP-level 429: honor an integer Retry-After header,
-    falling back to the in-band parser on the error body (and its default).
-    Reading the body here is fine — the caller retries instead of handing
-    the (now-consumed) response to ``_http_error``."""
-    header = (exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
-    if header.isdigit():  # HTTP-date form falls through to the body/default
-        return min(int(header), 120)
-    try:
-        text = exc.read().decode()
-    except (ValueError, OSError, http.client.HTTPException):
-        text = ""
-    return _retry_after_seconds(text)
+    return min(int(m.group(1)) if m else default, RETRY_AFTER_CAP_S)
 
 
 # --------------------------------------------------------------------------
@@ -1874,10 +1955,10 @@ def _apply_v1_results(response: dict, ext_owner: list, reports: dict, opts: argp
             rep.skipped.append(f"{kind}: rate limited (retry after {res.get('retry_after', '?')}s) — analysis skipped (fail-open).")
             continue
         if res.get("error"):
-            message = (res["error"] or {}).get("message", "error")
+            message = str((res["error"] or {}).get("message") or "error")
             if opts.fail_mode == "closed":
                 die(f"SIXTA extraction error and --fail-mode=closed: {message}", code=2)
-            rep.skipped.append(f"{kind}: {message} — analysis skipped (fail-open).")
+            rep.skipped.append(f"{kind}: {_hint_if_auth(message)} — analysis skipped (fail-open).")
             continue
         if res.get("report_text"):
             # Anchor the verdict to the exact statement it judged: with several
@@ -2166,7 +2247,7 @@ def warn(msg: str) -> None:
     print(f"sixta-review: WARNING: {msg}", file=sys.stderr)
 
 
-def die(msg: str, code: int = 2) -> None:
+def die(msg: str, code: int = 2) -> NoReturn:
     print(f"sixta-review: ERROR: {msg}", file=sys.stderr)
     raise SystemExit(code)
 
@@ -2209,6 +2290,48 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _write_empty_artifacts(opts: argparse.Namespace) -> None:
+    """Empty SARIF / code-quality file so `always`-gated upload steps have one."""
+    if opts.platform == "github":
+        write_sarif(build_sarif([]), opts.sarif)
+    else:
+        write_code_quality([], opts.code_quality)
+
+
+def _auth_failed(opts: argparse.Namespace, exc: SixtaAuthError) -> int:
+    """Single decision point for a rejected API key. In CI this always fails
+    (exit 2) regardless of --fail-mode — a bad key is persistent, and failing
+    open would keep pipelines green with analysis silently skipped — while
+    still publishing everything dependent steps and reviewers rely on: the
+    report/artifact files, and an upserted PR/MR note superseding the previous
+    run's verdict (a stale "gate passed" note must not stand next to a red
+    pipeline). A local pre-commit run warns and lets the commit proceed:
+    blocking every commit on a stale shell key would punish the developer,
+    not protect CI."""
+    if opts.local:
+        warn(f"SIXTA rejected the API key: {exc}")
+        warn("skipping SIXTA analysis for this commit — fix SIXTA_API_KEY to re-enable")
+        return 0
+    markdown = "\n".join([
+        NOTE_MARKER,
+        "## SIXTA SQL review",
+        "",
+        f"> ⚠️ Analysis did not run: {exc}",
+        "",
+        "Findings for this revision are unknown — fix the key and re-run the pipeline.",
+        "",
+    ])
+    with open(opts.report_md, "w", encoding="utf-8") as fh:
+        fh.write(markdown)
+    _write_empty_artifacts(opts)
+    if opts.platform == "github":
+        write_github_summary(markdown)
+        upsert_github_comment(markdown)
+    else:
+        upsert_mr_note(markdown)
+    die(f"SIXTA rejected the API key: {exc}", code=2)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     opts = build_parser().parse_args(argv)
     opts.platform = detect_platform(opts.platform)
@@ -2229,10 +2352,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not files:
         info("no changed migrations or SQL files — nothing to do")
         if not opts.local:
-            if opts.platform == "github":
-                write_sarif(build_sarif([]), opts.sarif)  # empty SARIF so the upload step has a file
-            else:
-                write_code_quality([], opts.code_quality)
+            _write_empty_artifacts(opts)
         return 0
     info(f"analyzing {len(files)} file(s): {', '.join(files)}")
 
@@ -2241,10 +2361,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     server_renders = None
     v1_context = None
     server_worst = None
-    if opts.api == "v1":
-        reports, server_renders, v1_context, server_worst = run_v1(files, opts, client, hints)
-    else:
-        reports = analyze_files(files, opts, client, hints)
+    try:
+        if opts.api == "v1":
+            reports, server_renders, v1_context, server_worst = run_v1(files, opts, client, hints)
+        else:
+            reports = analyze_files(files, opts, client, hints)
+    except SixtaAuthError as exc:
+        return _auth_failed(opts, exc)
     append_ddl_auto_note(reports)
     markdown = render_markdown(reports, opts.gate, v1_context)
 

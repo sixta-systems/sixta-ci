@@ -3,13 +3,13 @@
 import http.client
 import io
 import json
-import threading
 import urllib.error
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
 import sixta_review as sr
+from conftest import json_reply, run_stub_server
 
 
 # --------------------------------------------------------------------------
@@ -216,25 +216,34 @@ def test_ddl_groups_hinted_table_gets_own_call():
 
 class StubHandler(BaseHTTPRequestHandler):
     calls: list = []
-    behavior: str = "ok"  # ok | rate_limit_once | tool_error | http_401 | http_401_string_error | http_502_html | http_429_once | http_429_always
+    # ok | rate_limit_once | tool_error | tool_error_auth | http_401 | http_401_string_error
+    # | http_503 | http_429_once | http_429_always | rpc_auth_error | rpc_null_message | rpc_rate_limit_once
+    behavior: str = "ok"
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         StubHandler.calls.append({"body": body, "auth": self.headers.get("authorization")})
-        tool = body.get("params", {}).get("name")  # absent for /v1/analyze batches
+        tool = body.get("params", {}).get("name")  # absent for /v1/analyze batch bodies
+        if StubHandler.behavior == "http_401":
+            return self._json(401, {"error": {"code": "unauthorized", "message": "invalid API key"}})
+        if StubHandler.behavior == "http_401_string_error":
+            return self._json(401, {"error": "unauthorized"})  # REST shape some proxies use
+        if StubHandler.behavior == "http_503":
+            return self._json(503, {"error": {"code": "unavailable", "message": "deploy in progress"}})
         if StubHandler.behavior == "http_429_always" or (
             StubHandler.behavior == "http_429_once" and len(StubHandler.calls) == 1
         ):
-            return self._json(429, {"error": {"code": -32000, "message": "Rate limit reached."}},
-                              headers={"Retry-After": "1"})
-        if StubHandler.behavior == "http_401":
-            return self._json(401, {"jsonrpc": "2.0", "id": body["id"], "error": {
-                "code": -32001, "message": "Missing API key. Get a free key at connect.sixta.ai/portal",
-            }})
-        if StubHandler.behavior == "http_401_string_error":
-            return self._json(401, {"error": "unauthorized"})  # non-envelope body, e.g. from a proxy
-        if StubHandler.behavior == "http_502_html":
-            return self._respond(502, b"<html>Bad Gateway</html>", ctype="text/html")
+            return self._json(429, {"error": {"code": "rate_limited", "message": "slow down"}},
+                              headers={"retry-after": "0"})
+        if StubHandler.behavior == "rpc_auth_error":
+            return self._json(200, {"jsonrpc": "2.0", "id": body["id"],
+                                    "error": {"code": -32001, "message": "Unauthorized: invalid API key"}})
+        if StubHandler.behavior == "rpc_null_message":
+            return self._json(200, {"jsonrpc": "2.0", "id": body["id"],
+                                    "error": {"code": -32600, "message": None}})
+        if StubHandler.behavior == "rpc_rate_limit_once" and len(StubHandler.calls) == 1:
+            return self._json(200, {"jsonrpc": "2.0", "id": body["id"],
+                                    "error": {"code": -32000, "message": "Rate limit reached. wait about 0s and try again."}})
         if StubHandler.behavior == "rate_limit_once" and len(StubHandler.calls) == 1:
             result = {
                 "content": [{"type": "text", "text": "Rate limit reached. wait about 1s and try again."}],
@@ -242,23 +251,15 @@ class StubHandler(BaseHTTPRequestHandler):
             }
         elif StubHandler.behavior == "tool_error":
             result = {"content": [{"type": "text", "text": "boom"}], "isError": True}
+        elif StubHandler.behavior == "tool_error_auth":
+            result = {"content": [{"type": "text", "text": "Unauthorized: invalid API key"}], "isError": True}
         elif tool == "sixta_analyze_schema_change":
             result = {"content": [{"type": "text", "text": "**SIXTA schema-change analysis**"}], "structuredContent": SCHEMA_STRUCT}
         else:
             result = {"content": [{"type": "text", "text": "**SIXTA query analysis**"}], "structuredContent": QUERY_STRUCT}
-        self._json(200, {"jsonrpc": "2.0", "id": body.get("id"), "result": result})
+        self._json(200, {"jsonrpc": "2.0", "id": body["id"], "result": result})
 
-    def _json(self, status, body, headers=None):
-        self._respond(status, json.dumps(body).encode(), headers=headers)
-
-    def _respond(self, status, payload, ctype="application/json", headers=None):
-        self.send_response(status)
-        self.send_header("content-type", ctype)
-        self.send_header("content-length", str(len(payload)))
-        for name, value in (headers or {}).items():
-            self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(payload)
+    _json = json_reply
 
     def log_message(self, *args):  # silence
         pass
@@ -266,13 +267,7 @@ class StubHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def stub_server():
-    StubHandler.calls = []
-    StubHandler.behavior = "ok"
-    server = HTTPServer(("127.0.0.1", 0), StubHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}/mcp"
-    server.shutdown()
+    yield from run_stub_server(StubHandler)
 
 
 def test_client_sends_bearer_and_bare_tools_call(stub_server):
@@ -300,21 +295,15 @@ def test_client_retries_http_429(stub_server):
     assert result["structuredContent"]["verdict"] == "findings"
 
 
-def test_client_persistent_http_429_raises(stub_server):
+def test_client_persistent_http_429_is_connectivity(stub_server):
+    """Exhausted 429 retries are a transient condition: connectivity, so
+    --fail-mode (not the gate) decides, like any other outage."""
     StubHandler.behavior = "http_429_always"
     client = sr.SixtaClient(stub_server, api_key=None, max_retries=1)
-    with pytest.raises(sr.SixtaToolError) as exc:
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
         client.call("sixta_analyze_query", {"query": "SELECT 1"})
     assert len(StubHandler.calls) == 2  # initial attempt + 1 retry
-    assert "HTTP 429" in str(exc.value)
-
-
-def test_analyze_v1_retries_http_429(stub_server):
-    StubHandler.behavior = "http_429_once"
-    client = sr.SixtaClient(stub_server, api_key=None)
-    response = client.analyze_v1({"engine": "postgresql", "extractions": []})
-    assert len(StubHandler.calls) == 2
-    assert "result" in response  # the stub's generic 200 body came through
+    assert "HTTP 429" in str(exc.value) and "retries exhausted" in str(exc.value)
 
 
 def test_client_tool_error_raises(stub_server):
@@ -323,38 +312,156 @@ def test_client_tool_error_raises(stub_server):
         sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
 
 
-def test_client_http_error_surfaces_server_message(stub_server):
+def test_client_http_401_names_auth_not_unreachable(stub_server):
     StubHandler.behavior = "http_401"
-    with pytest.raises(sr.SixtaToolError) as exc:
-        sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
-    assert "connect.sixta.ai/portal" in str(exc.value)
-    assert "HTTP 401" in str(exc.value)  # status + URL kept for diagnosability
-    assert stub_server in str(exc.value)
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    msg = str(exc.value)
+    assert "HTTP 401" in msg
+    assert "SIXTA_API_KEY" in msg
+    assert "invalid API key" in msg
+    assert "unreachable" not in msg
 
 
-def test_client_http_error_tolerates_non_envelope_body(stub_server):
-    StubHandler.behavior = "http_401_string_error"  # {"error": "unauthorized"} — no .message dict
-    with pytest.raises(sr.SixtaToolError) as exc:
-        sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
-    assert "HTTP 401" in str(exc.value)
+def test_client_http_401_with_string_error_body(stub_server):
+    # {"error": "unauthorized"} (a shape some proxies use) must not crash the handler
+    StubHandler.behavior = "http_401_string_error"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    msg = str(exc.value)
+    assert "HTTP 401" in msg and "unauthorized" in msg and "SIXTA_API_KEY" in msg
 
 
-def test_client_gateway_error_is_connectivity(stub_server):
-    StubHandler.behavior = "http_502_html"  # LB answers for a down service, non-JSON body
+def test_client_http_503_is_connectivity(stub_server):
+    StubHandler.behavior = "http_503"
+    client = sr.SixtaClient(stub_server, api_key=None)
     with pytest.raises(sr.SixtaConnectivityError) as exc:
-        sr.SixtaClient(stub_server, api_key=None).call("sixta_analyze_query", {"query": "SELECT 1"})
-    assert "HTTP 502" in str(exc.value)
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "HTTP 503" in str(exc.value)
 
 
-def test_http_error_helper_survives_truncated_body():
-    class _Truncated(io.BytesIO):
-        def read(self, *args, **kwargs):
-            raise http.client.IncompleteRead(b"x")
+def test_client_http_429_retries(stub_server):
+    StubHandler.behavior = "http_429_once"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    result = client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert len(StubHandler.calls) == 2
+    assert result["structuredContent"]["verdict"] == "findings"
 
-    exc = urllib.error.HTTPError("http://x/mcp", 500, "boom", {}, _Truncated())
-    err = sr._http_error(exc, "http://x/mcp")
-    assert isinstance(err, sr.SixtaToolError)
-    assert "HTTP 500" in str(err)
+
+def test_client_http_401_anonymous_is_tool_error_not_auth(stub_server):
+    # No key configured (fork PRs, anonymous callers): fail-open must still apply.
+    StubHandler.behavior = "http_401"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    with pytest.raises(sr.SixtaToolError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert not isinstance(exc.value, sr.SixtaAuthError)
+    assert "set SIXTA_API_KEY" in str(exc.value)
+
+
+def test_client_rpc_auth_rejection_with_key_is_auth_error(stub_server):
+    # An unambiguous rejection ("Unauthorized: invalid API key") of a
+    # configured key gates even when it arrives as a 200 JSON-RPC error.
+    StubHandler.behavior = "rpc_auth_error"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "SIXTA_API_KEY" in str(exc.value)
+
+
+def test_client_rpc_auth_flavored_anonymous_stays_tool_error(stub_server):
+    # Without a configured key there is nothing to rotate: fail-open applies.
+    StubHandler.behavior = "rpc_auth_error"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    with pytest.raises(sr.SixtaToolError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert not isinstance(exc.value, sr.SixtaAuthError)
+    assert "SIXTA_API_KEY" in str(exc.value)
+
+
+def test_client_iserror_auth_rejection_with_key_is_auth_error(stub_server):
+    StubHandler.behavior = "tool_error_auth"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError):
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+
+
+def test_hint_decoration_is_tentative_and_gate_matcher_is_strict():
+    # Broad matcher decorates with a conditional hint, never a definitive claim
+    decorated = sr._hint_if_auth("Statement type forbidden by policy: DROP DATABASE")
+    assert "if this is an authentication problem" in decorated
+    assert "authentication failed" not in decorated
+    # The gate matcher must not fire on policy verdicts or quota nudges
+    assert not sr._is_auth_rejection("Statement type forbidden by policy: DROP DATABASE")
+    assert not sr._is_auth_rejection("your API key has exceeded its monthly quota")
+    assert sr._is_auth_rejection("Unauthorized: invalid API key")
+
+
+def test_client_rpc_error_null_message_does_not_crash(stub_server):
+    StubHandler.behavior = "rpc_null_message"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    with pytest.raises(sr.SixtaToolError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "-32600" in str(exc.value)  # falls back to the whole error object
+
+
+def test_client_rpc_rate_limit_retries(stub_server):
+    StubHandler.behavior = "rpc_rate_limit_once"
+    client = sr.SixtaClient(stub_server, api_key=None)
+    result = client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert len(StubHandler.calls) == 2
+    assert result["structuredContent"]["verdict"] == "findings"
+
+
+def test_http_error_message_survives_truncated_body():
+    class TruncatedBody(io.BytesIO):
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"")
+
+    exc = urllib.error.HTTPError("http://x/mcp", 502, "Bad Gateway", {}, TruncatedBody())
+    assert sr._http_error_message(exc, "http://x/mcp") == "HTTP 502 from http://x/mcp"
+
+
+def test_retry_after_header_parses_seconds_dates_and_garbage():
+    assert sr._retry_after_header_seconds("42") == 42
+    assert sr._retry_after_header_seconds("999") == sr.RETRY_AFTER_CAP_S
+    assert sr._retry_after_header_seconds(None) == sr.RETRY_AFTER_DEFAULT_S
+    assert sr._retry_after_header_seconds("not-a-date") == sr.RETRY_AFTER_DEFAULT_S
+    # HTTP-date in the past clamps to 0 instead of falling back to the default
+    assert sr._retry_after_header_seconds("Wed, 21 Oct 2015 07:28:00 GMT") == 0
+
+
+def test_redact_url_strips_credentials_and_query():
+    assert sr._redact_url("https://user:secret@sixta.corp:8443/mcp?token=abc#f") == \
+        "https://sixta.corp:8443/mcp"
+    assert sr._redact_url("http://[::1]:8080/mcp") == "http://[::1]:8080/mcp"
+
+
+def test_connectivity_error_redacts_url_credentials():
+    client = sr.SixtaClient("http://user:secret@127.0.0.1:1/mcp", api_key=None, timeout=1)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "secret" not in str(exc.value)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.analyze_v1({"engine": "postgresql", "extractions": []})
+    assert "secret" not in str(exc.value)
+
+
+def test_client_http_429_exhausted_says_rate_limited(stub_server):
+    StubHandler.behavior = "http_429_once"
+    client = sr.SixtaClient(stub_server, api_key=None, max_retries=0)
+    with pytest.raises(sr.SixtaConnectivityError) as exc:
+        client.call("sixta_analyze_query", {"query": "SELECT 1"})
+    assert "rate limited" in str(exc.value) and "HTTP 429" in str(exc.value)
+
+
+def test_auth_error_propagates_for_main_to_decide(stub_server):
+    # No mid-level catch may swallow or exit on SixtaAuthError; main() owns the policy.
+    StubHandler.behavior = "http_401"
+    client = sr.SixtaClient(stub_server, api_key="sk-bad")
+    with pytest.raises(sr.SixtaAuthError):
+        sr.analyze_sql(client, "x.py", "CREATE INDEX i ON t (c);", "postgresql", None, {}, "open")
 
 
 def test_client_connectivity_error():
