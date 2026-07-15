@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -280,7 +281,8 @@ class SixtaClient:
         The route always answers 200 for a well-formed batch (per-extraction
         rate-limit/errors ride inside ``results``); a 4xx/5xx carries a REST
         error body ``{error: {code, message}}`` and becomes a SixtaToolError,
-        while transport failures become a SixtaConnectivityError."""
+        while transport failures — including gateway errors and unfollowed
+        redirects, see ``_http_error`` — become a SixtaConnectivityError."""
         payload = json.dumps(request).encode()
         headers = {"content-type": "application/json"}
         if self.api_key:
@@ -290,12 +292,7 @@ class SixtaClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
-            try:
-                body = json.loads(exc.read().decode())
-                msg = (body.get("error") or {}).get("message") or f"HTTP {exc.code}"
-            except (ValueError, OSError):
-                msg = f"HTTP {exc.code}"
-            raise SixtaToolError(msg) from exc
+            raise _http_error(exc, self.v1_url) from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             raise SixtaConnectivityError(f"POST {self.v1_url} failed: {exc}") from exc
 
@@ -317,12 +314,7 @@ class SixtaClient:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode())
             except urllib.error.HTTPError as exc:  # subclass of URLError — catch first
-                try:
-                    err = json.loads(exc.read().decode())
-                    msg = (err.get("error") or {}).get("message") or f"HTTP {exc.code}"
-                except (ValueError, OSError):
-                    msg = f"HTTP {exc.code}"
-                raise SixtaToolError(msg) from exc
+                raise _http_error(exc, self.url) from exc
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
                 raise SixtaConnectivityError(f"POST {self.url} failed: {exc}") from exc
 
@@ -338,6 +330,28 @@ class SixtaClient:
                     continue
                 raise SixtaToolError(text)
             return result
+
+
+def _http_error(exc: urllib.error.HTTPError, url: str) -> Exception:
+    """Classify an HTTP error response from ``url``.
+
+    Unfollowed redirects (urllib refuses to re-POST a body on 3xx) and gateway
+    errors mean the service never handled the request — that's connectivity.
+    Anything else is the server rejecting the call: surface the error body's
+    ``error.message`` when present (the REST and JSON-RPC error envelopes both
+    carry ``{error: {code, message}}``), tolerating any malformed body."""
+    try:
+        body = json.loads(exc.read().decode())
+    except (ValueError, OSError, http.client.HTTPException):
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    msg = error.get("message") if isinstance(error, dict) else None
+    if exc.code < 400 or exc.code in (502, 503, 504):
+        detail = f": {msg}" if msg else ""
+        return SixtaConnectivityError(f"POST {url} failed: HTTP {exc.code}{detail}")
+    if msg:
+        return SixtaToolError(f"{msg} (HTTP {exc.code} from {url})")
+    return SixtaToolError(f"HTTP {exc.code} from {url}")
 
 
 def _result_text(result: dict) -> str:
