@@ -41,8 +41,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -629,6 +631,279 @@ def substitute_flyway_placeholders(sql: str, values: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# Liquibase (docs/spring-boot-support.md, Phase S2)
+#
+# Two changelog families, two mechanisms:
+# * formatted SQL (--liquibase formatted sql) — parsed statically: changesets
+#   split on `--changeset author:id`, inline `--rollback` feeds the rollback
+#   audit, `--property` values substitute ${...}. Only changesets that are new
+#   or edited vs the diff base are analyzed (changelogs are append-mostly).
+# * XML/YAML/JSON — rendered to SQL via the Liquibase CLI in offline mode
+#   (`--url=offline:<engine>`, no database). Offline connections persist
+#   executed changesets to a state CSV (./databasechangelog.csv by default!),
+#   so every invocation here points changeLogFile= at a throwaway temp CSV.
+#   Rollback = changelog-sync (mark all executed in the temp state) followed
+#   by rollback-count-sql with an overshoot count (Liquibase clamps it).
+#   A changelog that only includes other changelogs (the master/index) is not
+#   rendered: its leaves are analyzed when they themselves change.
+# --------------------------------------------------------------------------
+
+_LIQUIBASE_FORMATTED_RE = re.compile(r"^﻿?\s*--\s*liquibase\s+formatted\s+sql", re.I)
+_LIQUIBASE_CHANGESET_LINE = re.compile(r"^\s*--\s*changeset\s+([^:\s]+):(\S+)", re.I)
+_LIQUIBASE_ROLLBACK_LINE = re.compile(r"^\s*--\s*rollback(?:\s+(.*))?$", re.I)
+_LIQUIBASE_PROPERTY_LINE = re.compile(
+    r"^\s*--\s*property\s+name\s*=\s*\"?([\w.\-]+)\"?\s+value\s*=\s*\"?([^\"\n]*?)\"?\s*$", re.I)
+_LIQUIBASE_META_LINE = re.compile(
+    r"^\s*--\s*(?:precondition|comment|validCheckSum|ignoreLines|labels|logicalFilePath|liquibase)", re.I)
+
+_LIQUIBASE_STRUCTURED_EXTS = (".xml", ".yml", ".yaml", ".json")
+_LIQUIBASE_STRUCTURED_HINT_RE = re.compile(r"<databaseChangeLog\b|^\s*[\"']?databaseChangeLog[\"']?\s*:", re.M)
+_LIQUIBASE_INCLUDE_RE = re.compile(r"<include(?:All)?\b|^\s*-?\s*[\"']?include(?:All)?[\"']?\s*:", re.M)
+_LIQUIBASE_BOOKKEEPING_RE = re.compile(r"\bDATABASECHANGELOG(?:LOCK)?\b", re.I)
+
+_LIQUIBASE_INDEX_DESC = ("SIXTA: changelog index (include/includeAll) changed. Included changelogs are "
+                         "analyzed when they themselves change; nothing was rendered for the index itself.")
+_LIQUIBASE_INDEX_SECTION = "_Changelog index changed: included changelogs are analyzed when they change._"
+
+
+@dataclass
+class LiquibaseChangeset:
+    author: str
+    cid: str
+    sql: str
+    line: int
+    has_rollback: bool = False
+    rollback_sql: str = ""
+
+
+def _read_small(path: str, cap: int = 1_000_000) -> Optional[str]:
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > cap:
+            return None
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def is_liquibase_formatted(text: str) -> bool:
+    return bool(_LIQUIBASE_FORMATTED_RE.match(text or ""))
+
+
+def liquibase_structured_target(path: str) -> bool:
+    if not path.endswith(_LIQUIBASE_STRUCTURED_EXTS):
+        return False
+    text = _read_small(path)
+    return bool(text and _LIQUIBASE_STRUCTURED_HINT_RE.search(text))
+
+
+def parse_formatted_changelog(text: str) -> list[LiquibaseChangeset]:
+    """Changesets from a formatted-SQL changelog, with ``--property`` values
+    substituted into the SQL and inline ``--rollback`` lines collected.
+    A bare ``--rollback`` (or ``--rollback empty``) counts as a declared
+    empty rollback: has_rollback is true, rollback_sql stays empty."""
+    props: dict[str, str] = {}
+    changesets: list[LiquibaseChangeset] = []
+    current: Optional[LiquibaseChangeset] = None
+    sql_lines: list[str] = []
+    rollback_lines: list[str] = []
+
+    def _close() -> None:
+        if current is None:
+            return
+        current.sql = substitute_flyway_placeholders("\n".join(sql_lines).strip(), props)
+        current.rollback_sql = substitute_flyway_placeholders("\n".join(rollback_lines).strip(), props)
+        changesets.append(current)
+
+    for lineno, line in enumerate(text.splitlines(), 1):
+        m = _LIQUIBASE_CHANGESET_LINE.match(line)
+        if m:
+            _close()
+            current = LiquibaseChangeset(author=m.group(1), cid=m.group(2), sql="", line=lineno)
+            sql_lines, rollback_lines = [], []
+            continue
+        pm = _LIQUIBASE_PROPERTY_LINE.match(line)
+        if pm:
+            props[pm.group(1)] = pm.group(2)
+            continue
+        if current is None:
+            continue  # file header
+        rm = _LIQUIBASE_ROLLBACK_LINE.match(line)
+        if rm:
+            current.has_rollback = True
+            body = (rm.group(1) or "").strip()
+            if body and body.lower() != "empty":
+                rollback_lines.append(body)
+            continue
+        if _LIQUIBASE_META_LINE.match(line):
+            continue
+        sql_lines.append(line)
+    _close()
+    return changesets
+
+
+def _diff_base_ref(opts: argparse.Namespace) -> Optional[str]:
+    return getattr(opts, "base_sha", None) or ("HEAD" if getattr(opts, "local", False) else None)
+
+
+def _repo_relative(path: str) -> str:
+    """git show needs a repo-relative path; explicit CLI args may be absolute."""
+    if not os.path.isabs(path):
+        return path
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return os.path.relpath(path, proc.stdout.strip())
+    except OSError:
+        pass
+    return path
+
+
+def _file_at_diff_base(path: str, opts: argparse.Namespace) -> Optional[str]:
+    """The file's content at the diff base (CI: --base-sha; local: HEAD).
+    None when there is no base or the file did not exist there."""
+    ref = _diff_base_ref(opts)
+    if not ref:
+        return None
+    try:
+        proc = subprocess.run(["git", "show", f"{ref}:{_repo_relative(path)}"], capture_output=True, text=True)
+    except OSError:
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def new_formatted_changesets(path: str, text: str, opts: argparse.Namespace) -> list[LiquibaseChangeset]:
+    """The changesets that are new or edited relative to the diff base. With no
+    base available, every changeset counts (and old ones get re-analyzed)."""
+    changesets = parse_formatted_changelog(text)
+    base_text = _file_at_diff_base(path, opts)
+    if base_text is None:
+        return changesets
+    base = {(c.author, c.cid): c.sql for c in parse_formatted_changelog(base_text)}
+    return [c for c in changesets if base.get((c.author, c.cid)) != c.sql]
+
+
+def extract_liquibase_formatted(path: str, text: str, opts: argparse.Namespace) -> Optional[tuple[str, None]]:
+    new = new_formatted_changesets(path, text, opts)
+    if not new:
+        info(f"{path}: no new or edited changesets vs the diff base — nothing to analyze")
+        return None
+    return "\n".join(c.sql.rstrip().rstrip(";") + ";" for c in new if c.sql.strip()), None
+
+
+def liquibase_formatted_rollback(path: str, opts: argparse.Namespace) -> Optional[dict]:
+    """Rollback audit for a formatted-SQL changelog: the new changesets'
+    ``--rollback`` SQL, reversed (the order Liquibase would run them). Any new
+    changeset without a ``--rollback`` comment makes the whole change
+    ``missing`` (a batch rollback would fail there). Declared-empty rollbacks
+    count as present but contribute no SQL; if that leaves nothing, the audit
+    is unchecked rather than sending empty SQL."""
+    text = _read_small(path)
+    if text is None:
+        return None
+    if _diff_base_ref(opts) is None:
+        # No usable diff base: every changeset would look new, and one old
+        # changeset without --rollback would wrongly report the whole change
+        # as missing. Leave the audit unchecked instead of guessing.
+        info(f"rollback: {path}: no diff base to separate new changesets — rollback unchecked")
+        return None
+    new = new_formatted_changesets(path, text, opts)
+    if not new:
+        return None
+    if not all(c.has_rollback for c in new):
+        return {"status": "missing"}
+    parts = [c.rollback_sql for c in reversed(new) if c.rollback_sql.strip()]
+    if not parts:
+        info(f"rollback: {path}: all new changesets declare empty rollbacks — rollback unchecked")
+        return None
+    return {"sql": "\n".join(parts)}
+
+
+def _liquibase_cli(opts: argparse.Namespace) -> str:
+    return getattr(opts, "liquibase_cmd", None) or "liquibase"
+
+
+def _liquibase_engine(opts: argparse.Namespace) -> str:
+    engine = getattr(opts, "engine", None)
+    return engine if engine in ("postgresql", "mysql") else "postgresql"
+
+
+def _strip_liquibase_bookkeeping(sql: str) -> str:
+    """Drop DATABASECHANGELOG bookkeeping and comment-only blocks (the CLI's
+    header banner would otherwise pass for SQL)."""
+    stmts = [s for s in split_statements(sql)
+             if _first_keyword(s) and not _LIQUIBASE_BOOKKEEPING_RE.search(s)]
+    return ";\n".join(stmts) + (";" if stmts else "")
+
+
+def _offline_state_dir() -> tuple[str, str]:
+    """A throwaway offline-state CSV path (inside its own temp dir so cleanup
+    is one rmtree). The file must not pre-exist: Liquibase creates it."""
+    tmpdir = tempfile.mkdtemp(prefix="sixta-liquibase-")
+    return tmpdir, os.path.join(tmpdir, "state.csv")
+
+
+def render_liquibase(path: str, opts: argparse.Namespace) -> str:
+    """Offline render of an XML/YAML/JSON changelog via the Liquibase CLI
+    (mechanism A): ``update-sql`` against ``offline:<engine>`` needs no
+    database. The offline state CSV goes to a temp file so repeated runs
+    stay stateless (the default would persist ./databasechangelog.csv and
+    silently render nothing the second time). Renders the whole (leaf)
+    changelog; bookkeeping and comment banners are stripped."""
+    engine = _liquibase_engine(opts)
+    tmpdir, state = _offline_state_dir()
+    cmd = [_liquibase_cli(opts), "--search-path=.", f"--changelog-file={path}",
+           f"--url=offline:{engine}?changeLogFile={state}", "update-sql"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"liquibase CLI not available ({exc}) — install it in the CI job (see README, Spring Boot / "
+            f"Liquibase) to analyze XML/YAML changelogs, or keep changelogs in SQL format")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"liquibase update-sql for {os.path.basename(path)} failed:\n{proc.stderr.strip()[:400]}")
+    return _strip_liquibase_bookkeeping(proc.stdout)
+
+
+def liquibase_structured_rollback(path: str, opts: argparse.Namespace) -> Optional[dict]:
+    """Rollback audit for an XML/YAML/JSON changelog, verified against the
+    real CLI: ``changelog-sync`` marks every changeset executed in a throwaway
+    offline state CSV, then ``rollback-count-sql`` with an overshoot count
+    renders the reverse of all of them (Liquibase clamps the count;
+    ``future-rollback-sql`` renders nothing offline). A changeset with no
+    auto-inverse and no <rollback> block fails with a rollback-impossible
+    error -> ``missing``; other failures leave the audit unchecked."""
+    engine = _liquibase_engine(opts)
+    tmpdir, state = _offline_state_dir()
+    base = [_liquibase_cli(opts), "--search-path=.", f"--changelog-file={path}",
+            f"--url=offline:{engine}?changeLogFile={state}"]
+    try:
+        sync = subprocess.run(base + ["changelog-sync"], capture_output=True, text=True)
+        if sync.returncode != 0:
+            info(f"rollback: liquibase changelog-sync for {os.path.basename(path)} exited {sync.returncode} — rollback unchecked")
+            return None
+        proc = subprocess.run(base + ["rollback-count-sql", "999999"], capture_output=True, text=True)
+    except OSError as exc:
+        info(f"rollback: liquibase rollback render could not run ({exc}) — rollback unchecked")
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if proc.returncode == 0:
+        sql = _strip_liquibase_bookkeeping(proc.stdout)
+        if sql.strip():
+            return {"sql": sql}
+        info(f"rollback: liquibase rollback render for {os.path.basename(path)} rendered nothing — rollback unchecked")
+        return None
+    err = proc.stderr.lower()
+    if "rollbackimpossible" in err or "no inverse" in err or "does not support rollback" in err:
+        return {"status": "missing"}
+    info(f"rollback: liquibase rollback render for {os.path.basename(path)} exited {proc.returncode} — rollback unchecked")
+    return None
+
+
+# --------------------------------------------------------------------------
 # Framework dispatch — turn a changed file into SQL + an optional review note
 # --------------------------------------------------------------------------
 
@@ -677,7 +952,8 @@ def _manual_review(path: str, description: str, check_name: str, section: str) -
 
 def is_migration_file(path: str) -> bool:
     """Any file the kit knows how to turn into SQL (used by change discovery)."""
-    return bool(migration_target(path)) or alembic_target(path) or flyway_java_target(path) or path.endswith(".sql")
+    return (bool(migration_target(path)) or alembic_target(path) or flyway_java_target(path)
+            or liquibase_structured_target(path) or path.endswith(".sql"))
 
 
 def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str, Optional[tuple["Finding", str]]]]:
@@ -697,6 +973,11 @@ def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str
         return sql, manual
     if flyway_java_target(path):
         return "", _manual_review(path, _FLYWAY_JAVA_DESC, "flyway-java-manual-review", _FLYWAY_JAVA_SECTION)
+    if liquibase_structured_target(path):
+        text = _read_small(path) or ""
+        if _LIQUIBASE_INCLUDE_RE.search(text):
+            return "", _manual_review(path, _LIQUIBASE_INDEX_DESC, "changelog-index", _LIQUIBASE_INDEX_SECTION)
+        return render_liquibase(path, opts), None
     if path.endswith(".sql"):
         base = os.path.basename(path)
         if _is_rollback_sql_file(base) and _rollback_artifact_forward_exists(path):
@@ -712,6 +993,8 @@ def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str
                 sql = fh.read()
         except OSError as exc:
             raise RuntimeError(f"cannot read {path}: {exc}")
+        if is_liquibase_formatted(sql):
+            return extract_liquibase_formatted(path, sql, opts)
         if _is_flyway_sql(base) and "${" in sql:
             sql = substitute_flyway_placeholders(sql, flyway_placeholders())
         return sql, None
@@ -878,7 +1161,15 @@ def extract_rollback(path: str, opts: argparse.Namespace) -> Optional[dict]:
         return django_rollback(opts.manage_py, app, name)
     if alembic_target(path):
         return alembic_rollback(path, opts)
+    if liquibase_structured_target(path):
+        text = _read_small(path) or ""
+        if _LIQUIBASE_INCLUDE_RE.search(text):
+            return None  # index of other changelogs — nothing of its own to roll back
+        return liquibase_structured_rollback(path, opts)
     if path.endswith(".sql"):
+        head = _read_small(path)
+        if head is not None and is_liquibase_formatted(head):
+            return liquibase_formatted_rollback(path, opts)
         return sql_rollback(path)
     return None
 
@@ -1488,6 +1779,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--manage-py", default=os.environ.get("SIXTA_MANAGE_PY", "manage.py"))
     p.add_argument("--alembic-config", default=os.environ.get("SIXTA_ALEMBIC_CONFIG", "alembic.ini"),
                    help="Alembic config file for offline SQL rendering (alembic upgrade --sql)")
+    p.add_argument("--liquibase-cmd", default=os.environ.get("SIXTA_LIQUIBASE_CMD", "liquibase"),
+                   help="Liquibase CLI used to render XML/YAML/JSON changelogs offline (update-sql; no database needed)")
     p.add_argument("--base-sha", default=os.environ.get("CI_MERGE_REQUEST_DIFF_BASE_SHA"))
     p.add_argument("--report-md", default=REPORT_MD)
     p.add_argument("--code-quality", default=CODE_QUALITY_JSON)

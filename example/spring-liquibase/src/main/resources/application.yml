@@ -1,0 +1,5 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/shop
+  liquibase:
+    change-log: classpath:/db/changelog/db.changelog-master.yaml

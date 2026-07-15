@@ -59,6 +59,9 @@ spec:
       type: boolean
       default: false
       description: v1 only. true raises the no-rollback finding to gate-able severity. Leave false for roll-forward-only policies.
+    liquibase_cmd:
+      default: "liquibase"
+      description: Liquibase CLI for offline changelog rendering (update-sql). Install it via `setup` when using XML/YAML/JSON changelogs; SQL-format changelogs need no CLI.
     sixta_url:
       default: "https://connect.sixta.ai/mcp"
     script_ref:
@@ -79,6 +82,7 @@ sixta-review:
         - "**/migrations/*.py"
         - "**/*.sql"
         - "**/db/migration/**" # Flyway, including Java-based migrations
+        - "**/db/changelog/**" # Liquibase changelogs
   services:
     # sqlmigrate needs a live connection (Django resolves constraint names
     # through the schema editor). An empty database is fine.
@@ -99,6 +103,7 @@ sixta-review:
     SIXTA_FAIL_MODE: $[[ inputs.fail_mode ]]
     SIXTA_URL: $[[ inputs.sixta_url ]]
     SIXTA_MANAGE_PY: $[[ inputs.manage_py ]]
+    SIXTA_LIQUIBASE_CMD: $[[ inputs.liquibase_cmd ]]
   script:
     - $[[ inputs.setup ]]
     - curl -fsSL "https://raw.githubusercontent.com/sixta-systems/sixta-ci/$[[ inputs.script_ref ]]/sixta_review.py" -o /tmp/sixta_review.py
