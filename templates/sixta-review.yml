@@ -30,8 +30,9 @@ spec:
     manage_py:
       default: "manage.py"
     engine:
-      default: "postgresql"
-      options: ["postgresql", "mysql"]
+      default: "auto"
+      options: ["auto", "postgresql", "mysql"]
+      description: auto detects the engine from pom.xml / build.gradle / application.*, falling back to postgresql.
     engine_version:
       default: ""
       description: Production engine version, e.g. "16" or "8.0.35". Verdicts are version-dependent — set this.
@@ -77,6 +78,7 @@ sixta-review:
       changes:
         - "**/migrations/*.py"
         - "**/*.sql"
+        - "**/db/migration/**" # Flyway, including Java-based migrations
   services:
     # sqlmigrate needs a live connection (Django resolves constraint names
     # through the schema editor). An empty database is fine.

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""sixta-review — SIXTA Connect SQL review for Django migrations in GitLab CI.
+"""sixta-review — SIXTA Connect SQL review for database migrations in CI.
 
-Renders every migration changed in a merge request to SQL (via
-``manage.py sqlmigrate``), sends DDL to SIXTA's ``sixta_analyze_schema_change``
+Renders every migration changed in a merge/pull request to SQL (Django via
+``manage.py sqlmigrate``, Alembic via offline ``alembic upgrade --sql``, Flyway
+and other ``.sql`` migrations read directly with Flyway ``${placeholder}``
+substitution), sends DDL to SIXTA's ``sixta_analyze_schema_change``
 and DML to ``sixta_analyze_query``, and reports back three ways:
 
 * ``sixta-report.md``            — the full SIXTA markdown reports
@@ -504,6 +506,129 @@ def alembic_data_ops(path: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Spring Boot / Flyway (docs/spring-boot-support.md, Phase S1)
+# --------------------------------------------------------------------------
+
+# Repeatable migration basename (R__views.sql) and Java-based migration path
+# (src/main/java/**/db/migration/V3__Backfill.java — renders no SQL offline).
+_FLYWAY_REPEATABLE_RE = re.compile(r"^R__.+\.sql$")
+_FLYWAY_JAVA_RE = re.compile(r"(?:^|/)db/migration/(?:[^/]+/)*[VRU][^/]*__[^/]*\.java$")
+# Flyway placeholder token; names may carry dots/colons (${flyway:defaultSchema}).
+_FLYWAY_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z0-9_.:\-]+)\}")
+
+_SPRING_BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
+_SPRING_CONFIG_DIRS = (".", "src/main/resources", "src/main/resources/config", "config")
+# Engine markers in build/config text, strongest first: the Flyway 10+ per-DB
+# module, then the JDBC driver artifact, then the datasource URL. A hit on both
+# engines is ambiguous and detection abstains (with a warning).
+_ENGINE_MARKERS = (
+    ("postgresql", re.compile(r"flyway-database-postgresql|org\.postgresql|jdbc:postgresql|postgresql://", re.I)),
+    ("mysql", re.compile(r"flyway-mysql|mysql-connector|com\.mysql|jdbc:(?:mysql|mariadb)|mysql://", re.I)),
+)
+
+
+def flyway_java_target(path: str) -> bool:
+    return bool(_FLYWAY_JAVA_RE.search(path.replace(os.sep, "/")))
+
+
+def _is_flyway_sql(basename: str) -> bool:
+    return bool(_FLYWAY_VERSIONED_RE.match(basename) or _FLYWAY_REPEATABLE_RE.match(basename)
+                or _FLYWAY_UNDO_RE.match(basename))
+
+
+def _spring_files(root: str = ".") -> list[tuple[str, str]]:
+    """(path, text) for the build + Spring config files that reveal the engine
+    and Flyway placeholder values. Best-effort: unreadable or oversized files
+    are skipped."""
+    paths = [os.path.join(root, n) for n in _SPRING_BUILD_FILES]
+    for d in _SPRING_CONFIG_DIRS:
+        base = os.path.join(root, d)
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        paths += [os.path.join(base, n) for n in entries
+                  if n.startswith("application") and n.endswith((".properties", ".yml", ".yaml"))]
+    out: list[tuple[str, str]] = []
+    for path in paths:
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > 512_000:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                out.append((path, fh.read()))
+        except OSError:
+            continue
+    return out
+
+
+def detect_engine(root: str = ".") -> Optional[str]:
+    """Best-effort engine detection for JVM/Spring repos, used when
+    --engine/SIXTA_ENGINE is ``auto`` or unset. Returns None when no marker
+    matched, or when both engines matched (ambiguous)."""
+    matched = {engine for _, text in _spring_files(root)
+               for engine, pat in _ENGINE_MARKERS if pat.search(text)}
+    if len(matched) > 1:
+        warn("both postgresql and mysql markers found in build/config files; set --engine / SIXTA_ENGINE explicitly")
+        return None
+    return matched.pop() if matched else None
+
+
+def resolve_engine(explicit: Optional[str]) -> str:
+    """An explicitly configured engine wins; ``auto``/unset tries
+    :func:`detect_engine` and falls back to postgresql (the historical
+    default), saying which happened."""
+    if explicit and explicit != "auto":
+        return explicit
+    detected = detect_engine()
+    if detected:
+        info(f"engine auto-detected: {detected} (set --engine / SIXTA_ENGINE to override)")
+    else:
+        info("engine not configured and not detectable from build/config files; assuming postgresql")
+    return detected or "postgresql"
+
+
+def flyway_placeholders(root: str = ".") -> dict[str, str]:
+    """Configured placeholder values (``spring.flyway.placeholders.<name>``)
+    from Spring config: .properties parsed directly, .yml/.yaml via PyYAML when
+    installed. Unconfigured placeholders fall back to their own name at
+    substitution time, so missing config is fine."""
+    values: dict[str, str] = {}
+    for path, text in _spring_files(root):
+        if path.endswith(".properties"):
+            for m in re.finditer(r"^\s*spring\.flyway\.placeholders\.([A-Za-z0-9_.\-]+)\s*[=:]\s*(.*?)\s*$", text, re.M):
+                values[m.group(1)] = m.group(2)
+        else:
+            try:
+                import yaml  # type: ignore
+            except ImportError:
+                continue
+            try:
+                docs = list(yaml.safe_load_all(text))
+            except yaml.YAMLError:
+                continue
+            for doc in docs:
+                node = doc
+                for key in ("spring", "flyway", "placeholders"):
+                    node = node.get(key) if isinstance(node, dict) else None
+                if isinstance(node, dict):
+                    values.update({str(k): str(v) for k, v in node.items()})
+    return values
+
+
+def substitute_flyway_placeholders(sql: str, values: dict) -> str:
+    """Replace Flyway ``${placeholder}`` tokens before analysis: the configured
+    value when known, else the placeholder's own name as a bare token (valid in
+    both identifier and string-literal positions). Flyway substitutes these
+    everywhere in the script, so this mirrors what actually executes."""
+    def _repl(m: "re.Match[str]") -> str:
+        name = m.group(1)
+        if name in values:
+            return str(values[name])
+        return re.sub(r"[^A-Za-z0-9_]", "_", name)
+    return _FLYWAY_PLACEHOLDER_RE.sub(_repl, sql)
+
+
+# --------------------------------------------------------------------------
 # Framework dispatch — turn a changed file into SQL + an optional review note
 # --------------------------------------------------------------------------
 
@@ -514,6 +639,12 @@ _ALEMBIC_DATA_DESC = ("SIXTA: migration contains data-migration code (op.bulk_in
                       "analyzable DDL offline and was NOT analyzed. Review it by hand (long transactions, "
                       "per-row updates on big tables).")
 _ALEMBIC_DATA_SECTION = "_Contains data-migration code: not renderable to SQL — flagged for human review._"
+_FLYWAY_JAVA_DESC = ("SIXTA: Flyway Java-based migration. It renders no SQL offline and was NOT analyzed. "
+                     "Review the migration code by hand (long transactions, per-row updates on big tables).")
+_FLYWAY_JAVA_SECTION = "_Java-based Flyway migration: not renderable to SQL offline. Flagged for human review._"
+_ROLLBACK_ARTIFACT_DESC = ("SIXTA: rollback artifact (undo script). Not analyzed as a forward change; when its "
+                           "forward migration is in this changeset, the rollback audit covers it there.")
+_ROLLBACK_ARTIFACT_SECTION = "_Rollback artifact: feeds the forward migration's rollback audit, not analyzed as a forward change._"
 
 
 def _manual_review(path: str, description: str, check_name: str, section: str) -> tuple["Finding", str]:
@@ -522,7 +653,7 @@ def _manual_review(path: str, description: str, check_name: str, section: str) -
 
 def is_migration_file(path: str) -> bool:
     """Any file the kit knows how to turn into SQL (used by change discovery)."""
-    return bool(migration_target(path)) or alembic_target(path) or path.endswith(".sql")
+    return bool(migration_target(path)) or alembic_target(path) or flyway_java_target(path) or path.endswith(".sql")
 
 
 def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str, Optional[tuple["Finding", str]]]]:
@@ -540,12 +671,23 @@ def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str
         sql = render_alembic(path, opts)
         manual = _manual_review(path, _ALEMBIC_DATA_DESC, "data-migration-manual-review", _ALEMBIC_DATA_SECTION) if alembic_data_ops(path) else None
         return sql, manual
+    if flyway_java_target(path):
+        return "", _manual_review(path, _FLYWAY_JAVA_DESC, "flyway-java-manual-review", _FLYWAY_JAVA_SECTION)
     if path.endswith(".sql"):
+        base = os.path.basename(path)
+        if _is_rollback_sql_file(base):
+            # An undo script is not a forward change: its content rides on the
+            # forward migration's rollback audit (see sql_rollback), so grading
+            # its DROPs as production risk would be a false alarm.
+            return "", _manual_review(path, _ROLLBACK_ARTIFACT_DESC, "rollback-artifact", _ROLLBACK_ARTIFACT_SECTION)
         try:
             with open(path, encoding="utf-8") as fh:
-                return fh.read(), None
+                sql = fh.read()
         except OSError as exc:
             raise RuntimeError(f"cannot read {path}: {exc}")
+        if _is_flyway_sql(base) and "${" in sql:
+            sql = substitute_flyway_placeholders(sql, flyway_placeholders())
+        return sql, None
     return None
 
 
@@ -654,10 +796,15 @@ def _is_rollback_sql_file(basename: str) -> bool:
 def _read_rollback_file(path: str) -> Optional[dict]:
     try:
         with open(path, encoding="utf-8") as fh:
-            return {"sql": fh.read()}
+            sql = fh.read()
     except OSError as exc:
         info(f"rollback: cannot read companion {path} ({exc}) — rollback unchecked")
         return None
+    # Flyway substitutes ${placeholders} in undo scripts exactly like forward
+    # ones; mirror that so the server analyzes what would actually run.
+    if _is_flyway_sql(os.path.basename(path)) and "${" in sql:
+        sql = substitute_flyway_placeholders(sql, flyway_placeholders())
+    return {"sql": sql}
 
 
 def sql_rollback(path: str) -> Optional[dict]:
@@ -669,6 +816,10 @@ def sql_rollback(path: str) -> Optional[dict]:
     checked (``None``)."""
     base = os.path.basename(path)
     if _is_rollback_sql_file(base):
+        return None
+    if _FLYWAY_REPEATABLE_RE.match(base):
+        # Repeatable migrations re-run on every checksum change; their rollback
+        # is the previous file version, so a missing-undo finding would be noise.
         return None
     directory = os.path.dirname(path) or "."
     m = _FLYWAY_VERSIONED_RE.match(base)
@@ -1297,7 +1448,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="mcp: one JSON-RPC call per statement group; v1: one batch POST per run (default on GitHub)")
     p.add_argument("--schema-cmd", default=os.environ.get("SIXTA_SCHEMA_CMD") or None,
                    help="v1 only: command whose stdout is the shared schema DDL (default: pg_dump when a DB is configured)")
-    p.add_argument("--engine", default=os.environ.get("SIXTA_ENGINE", "postgresql"), choices=["postgresql", "mysql"])
+    p.add_argument("--engine", default=os.environ.get("SIXTA_ENGINE") or "auto", choices=["auto", "postgresql", "mysql"],
+                   help="database engine; auto (default) detects it from pom.xml / build.gradle / application.* and falls back to postgresql")
     p.add_argument("--engine-version", default=os.environ.get("SIXTA_ENGINE_VERSION") or None)
     p.add_argument("--gate", default=os.environ.get("SIXTA_GATE", "high"), choices=list(GATE_RANK))
     p.add_argument("--fail-mode", default=os.environ.get("SIXTA_FAIL_MODE", "open"), choices=["open", "closed"],
@@ -1327,6 +1479,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         warn("--require-rollback has no effect in mcp mode — the rollback audit is /v1 only (set SIXTA_API=v1)")
     if opts.platform == "github" and not opts.base_sha:
         opts.base_sha = github_base_sha()
+    opts.engine = resolve_engine(opts.engine)
 
     api_key = os.environ.get("SIXTA_API_KEY")
     if not api_key:
