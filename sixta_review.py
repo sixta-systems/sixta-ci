@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NoReturn, Optional
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 DEFAULT_SIXTA_URL = "https://connect.sixta.ai/mcp"
 REPORT_MD = "sixta-report.md"

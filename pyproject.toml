@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sixta-review"
-version = "0.4.1"
+version = "0.4.2"
 description = "SIXTA Connect SQL review for Django migrations — GitLab CI job + pre-commit hook"
 readme = "README.md"
 requires-python = ">=3.9"
