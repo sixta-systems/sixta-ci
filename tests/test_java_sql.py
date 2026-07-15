@@ -207,14 +207,16 @@ def test_mybatis_choose_takes_first_when():
     assert fragments == ["SELECT * FROM t WHERE a = ?"]
 
 
-def test_mybatis_dollar_interpolation_flags_medium_finding(tmp_path):
+def test_mybatis_dollar_interpolation_flags_info_finding(tmp_path):
+    """Advisory (Info): a local severity can't gate consistently across api
+    modes, since v1's server worst_severity is authoritative."""
     m = tmp_path / "OrderMapper.xml"
     m.write_text(MAPPER)
     sql, manual = sr.extract_migration(str(m), _opts())
     assert "SELECT" in sql
     finding, section = manual
     assert finding.check_name == "mybatis-string-interpolation"
-    assert finding.severity == "Medium"
+    assert finding.severity == "Info"
     assert "${" in section or "interpolation" in section
 
 
@@ -246,3 +248,94 @@ def test_run_v1_java_dml_becomes_query_extractions(tmp_path):
     kinds = [e["kind"] for e in client.request["extractions"]]
     assert kinds == ["query"]
     assert client.request["extractions"][0]["sql"] == "SELECT * FROM orders WHERE status = ?"
+
+
+# --------------------------------------------------------------------------
+# Review-pass regression tests (adversarial findings, each reproduced first)
+# --------------------------------------------------------------------------
+
+def test_jpql_only_file_is_not_discovered(tmp_path):
+    """Bare @Query (JPQL) must not trigger discovery: it extracts nothing and
+    would leave 'analyzed, 0 findings' noise on every JPA PR."""
+    f = tmp_path / "Repo.java"
+    f.write_text('import org.springframework.data.jpa.repository.Query;\n'
+                 'interface R { @Query("SELECT o FROM Order o") List<Order> a(); }')
+    assert not sr.java_sql_target(str(f))
+
+
+def test_data_jdbc_file_is_discovered_via_import(tmp_path):
+    f = tmp_path / "Repo.java"
+    f.write_text('import org.springframework.data.jdbc.repository.query.Query;\n'
+                 'interface R { @Query("SELECT * FROM orders") List<Order> a(); }')
+    assert sr.java_sql_target(str(f))
+
+
+def test_constant_with_semicolon_inside_string():
+    src_java = (
+        'class D {\n'
+        '  static final String CLEANUP = "DELETE FROM audit_log WHERE created < now() - interval \'90 days\';";\n'
+        '  void f(JdbcTemplate t) { t.update(CLEANUP); }\n'
+        '}'
+    )
+    assert sr.extract_java_sql(src_java) == ["DELETE FROM audit_log WHERE created < now() - interval '90 days';"]
+
+
+def test_comment_with_unbalanced_paren_inside_annotation():
+    src_java = ('@Query(value = "SELECT * FROM orders WHERE id = ?1", // legacy lookup :)\n'
+                '       nativeQuery = true)\n'
+                'List<Order> byId(long id);')
+    assert sr.extract_java_sql(src_java) == ["SELECT * FROM orders WHERE id = ?"]
+
+
+def test_dynamic_concatenation_is_skipped_not_holed():
+    """'SELECT * FROM ' + TABLE with an unresolvable operand must be skipped:
+    analyzing 'SELECT * FROM  WHERE ...' would mislead."""
+    src_java = ('void f(JdbcTemplate t, String table) {\n'
+                '  t.query("SELECT * FROM " + table + " WHERE id = ?", m);\n'
+                '}')
+    assert sr.extract_java_sql(src_java) == []
+
+
+def test_concatenation_through_constant_resolves():
+    src_java = ('class D { static final String T = "orders";\n'
+                '  void f(JdbcTemplate t) { t.query("SELECT * FROM " + T + " WHERE id = ?", m); } }')
+    assert sr.extract_java_sql(src_java) == ["SELECT * FROM orders WHERE id = ?"]
+
+
+def test_mybatis_selectkey_not_merged_into_parent():
+    xml = ('<mapper namespace="m"><insert id="i">\n'
+           '  <selectKey keyProperty="id" resultType="long" order="AFTER">SELECT LAST_INSERT_ID()</selectKey>\n'
+           '  INSERT INTO orders (total) VALUES (#{total})\n'
+           '</insert></mapper>')
+    fragments, _ = sr.extract_mybatis_sql(xml)
+    assert fragments == ["INSERT INTO orders (total) VALUES (?)"]
+
+
+def test_mybatis_trim_prefix_and_overrides():
+    xml = ('<mapper namespace="m"><select id="s">SELECT * FROM orders\n'
+           '  <trim prefix="WHERE" prefixOverrides="AND |OR ">AND status = #{s}</trim>\n'
+           '</select></mapper>')
+    fragments, _ = sr.extract_mybatis_sql(xml)
+    assert fragments == ["SELECT * FROM orders WHERE status = ?"]
+
+
+def test_mybatis_foreach_open_close():
+    xml = ('<mapper namespace="m"><select id="s">SELECT * FROM orders WHERE id IN\n'
+           '  <foreach item="i" collection="ids" open="(" separator="," close=")">#{i}</foreach>\n'
+           '</select></mapper>')
+    fragments, _ = sr.extract_mybatis_sql(xml)
+    assert fragments == ["SELECT * FROM orders WHERE id IN (?)"]
+
+
+def test_mybatis_unresolvable_include_skips_statement():
+    xml = ('<mapper namespace="m"><select id="s">SELECT <include refid="com.other.Mapper.cols"/> FROM orders</select>'
+           '<select id="t">SELECT id FROM orders</select></mapper>')
+    fragments, _ = sr.extract_mybatis_sql(xml)
+    assert fragments == ["SELECT id FROM orders"]  # incomplete one skipped, sibling kept
+
+
+def test_mybatis_cyclic_include_does_not_crash():
+    xml = ('<mapper namespace="m"><sql id="a"><include refid="a"/></sql>'
+           '<select id="s">SELECT <include refid="a"/> FROM orders</select></mapper>')
+    fragments, _ = sr.extract_mybatis_sql(xml)
+    assert fragments == []

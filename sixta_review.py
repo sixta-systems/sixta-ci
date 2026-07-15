@@ -914,17 +914,22 @@ def liquibase_structured_rollback(path: str, opts: argparse.Namespace) -> Option
 # queries would only produce false positives in a SQL analyzer.
 # --------------------------------------------------------------------------
 
-# A .java file is worth reading only when it hints at embedded SQL.
+# A .java file is worth reading only when it hints at NATIVE embedded SQL.
+# Bare @Query is deliberately absent: a JPQL-only repository would be
+# discovered, extract nothing, and leave noise ("analyzed, 0 findings") on
+# every JPA PR. nativeQuery/@NativeQuery/@NamedNativeQuery, the JDBC/R2DBC
+# call sites, and the Spring Data JDBC/R2DBC Query import cover the SQL cases.
 _JAVA_SQL_HINT_RE = re.compile(
-    r"@(?:Query|NativeQuery|NamedNativeQuery)\b|JdbcTemplate|NamedParameterJdbcTemplate|JdbcClient"
-    r"|DatabaseClient|createNativeQuery")
+    r"nativeQuery|@(?:NativeQuery|NamedNativeQuery)\b|JdbcTemplate|NamedParameterJdbcTemplate|JdbcClient"
+    r"|DatabaseClient|createNativeQuery"
+    r"|org\.springframework\.data\.(?:jdbc|r2dbc)\.repository\.query\.Query")
 _JAVA_TEXT_BLOCK_RE = re.compile(r'"""\n?(.*?)"""', re.S)
 _JAVA_STRING_RE = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
 _JAVA_ANNOTATION_RE = re.compile(r"@(Query|NativeQuery|NamedNativeQuery)\s*\(")
 _JAVA_CALL_RE = re.compile(
     r"\.\s*(query|queryForObject|queryForList|queryForMap|queryForRowSet|queryForStream"
     r"|update|batchUpdate|execute|sql|createNativeQuery)\s*\(")
-_JAVA_CONSTANT_RE = re.compile(r"String\s+(\w+)\s*=\s*([^;]+);")
+_JAVA_CONSTANT_RE = re.compile(r'String\s+(\w+)\s*=\s*((?:"""\n?(?s:.*?)"""|"(?:[^"\\\n]|\\.)*"|[^;])+);')
 # Spring Data JDBC / R2DBC repositories: @Query is always native SQL there.
 _JAVA_NATIVE_QUERY_IMPORT_RE = re.compile(
     r"import\s+org\.springframework\.data\.(?:jdbc|r2dbc)\.repository\.query\.Query\s*;")
@@ -937,17 +942,34 @@ _MYBATIS_DOLLAR_DESC = ("SIXTA: MyBatis ${...} string interpolation in this mapp
 _MYBATIS_DOLLAR_SECTION = "_Mapper uses `${...}` string interpolation: injection-prone, prefer `#{...}` parameters._"
 
 
+def _skip_java_noncode(text: str, i: int) -> int:
+    """The index just past a string literal or comment starting at i, or i when
+    none starts here. Keeps paren counting honest: a ')' inside a string,
+    // comment, or /* comment */ is not code."""
+    ch = text[i]
+    if ch == '"':
+        block = _JAVA_TEXT_BLOCK_RE.match(text, i) or _JAVA_STRING_RE.match(text, i)
+        if block:
+            return block.end()
+    elif ch == "/" and text[i:i + 2] == "//":
+        nl = text.find("\n", i)
+        return len(text) if nl == -1 else nl
+    elif ch == "/" and text[i:i + 2] == "/*":
+        end = text.find("*/", i + 2)
+        return len(text) if end == -1 else end + 2
+    return i
+
+
 def _balanced_paren_span(text: str, open_idx: int) -> Optional[str]:
     """The content between text[open_idx] == '(' and its matching ')', skipping
-    string literals. None when unbalanced (malformed source)."""
+    string literals and comments. None when unbalanced (malformed source)."""
     depth, i, n = 0, open_idx, len(text)
     while i < n:
+        j = _skip_java_noncode(text, i)
+        if j != i:
+            i = j
+            continue
         ch = text[i]
-        if ch == '"':
-            block = _JAVA_TEXT_BLOCK_RE.match(text, i) or _JAVA_STRING_RE.match(text, i)
-            if block:
-                i = block.end()
-                continue
         if ch == "(":
             depth += 1
         elif ch == ")":
@@ -958,23 +980,25 @@ def _balanced_paren_span(text: str, open_idx: int) -> Optional[str]:
     return None
 
 
-def _split_top_level(args: str) -> list[str]:
-    """Split an annotation/call argument blob on top-level commas."""
+def _split_top_level(args: str, sep: str = ",") -> list[str]:
+    """Split an annotation/call argument blob (or a string expression) on a
+    top-level separator, ignoring separators inside strings, comments, and
+    brackets."""
     parts: list[str] = []
     depth, buf, i, n = 0, [], 0, len(args)
     while i < n:
+        j = _skip_java_noncode(args, i)
+        if j != i:
+            if args[i] == '"':
+                buf.append(args[i:j])  # keep strings, drop comments
+            i = j
+            continue
         ch = args[i]
-        if ch == '"':
-            block = _JAVA_TEXT_BLOCK_RE.match(args, i) or _JAVA_STRING_RE.match(args, i)
-            if block:
-                buf.append(block.group(0))
-                i = block.end()
-                continue
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
             depth -= 1
-        if ch == "," and depth == 0:
+        if ch == sep and depth == 0:
             parts.append("".join(buf))
             buf = []
         else:
@@ -990,28 +1014,35 @@ def _java_unescape(s: str) -> str:
             .replace(r"\"", '"').replace(r"\'", "'").replace("\\\\", "\\"))
 
 
-def _string_pieces(expr: str, constants: dict) -> str:
-    """All string-literal content in a Java expression, joined in order,
-    which is exactly what ``"a" + "b"`` concatenation evaluates to. A bare
-    identifier resolves through the file's String constants."""
-    ident = expr.strip()
-    if re.fullmatch(r"\w+", ident) and ident in constants:
-        expr = constants[ident]
-    pieces: list[str] = []
-    i, n = 0, len(expr)
-    while i < n:
-        block = _JAVA_TEXT_BLOCK_RE.match(expr, i)
+def _resolve_string_expr(expr: str, constants: dict, depth: int = 0) -> Optional[str]:
+    """The compile-time value of a Java string expression: literals and
+    same-file String constants joined by ``+``. None when any operand is
+    dynamic (a method call, parameter, unknown identifier): analyzing SQL with
+    holes ("SELECT * FROM  WHERE ...") would mislead, so such fragments are
+    skipped entirely."""
+    if depth > 5:
+        return None
+    out: list[str] = []
+    for part in _split_top_level(expr, "+"):
+        s = part.strip()
+        if not s:
+            return None
+        block = _JAVA_TEXT_BLOCK_RE.fullmatch(s)
         if block:
-            pieces.append(block.group(1))
-            i = block.end()
+            out.append(block.group(1))
             continue
-        m = _JAVA_STRING_RE.match(expr, i)
+        m = _JAVA_STRING_RE.fullmatch(s)
         if m:
-            pieces.append(_java_unescape(m.group(1)))
-            i = m.end()
+            out.append(_java_unescape(m.group(1)))
             continue
-        i += 1
-    return "".join(pieces)
+        if re.fullmatch(r"\w+", s) and s in constants:
+            resolved = _resolve_string_expr(constants[s], constants, depth + 1)
+            if resolved is None:
+                return None
+            out.append(resolved)
+            continue
+        return None
+    return "".join(out) if out else None
 
 
 def _java_constants(text: str) -> dict:
@@ -1063,7 +1094,7 @@ def extract_java_sql(text: str) -> list[str]:
         if name == "Query" and not jdbc_query_import and "true" not in named.get("nativeQuery", ""):
             continue  # JPQL, not SQL
         expr = named.get("value") or named.get("query") or positional or ""
-        sql = _string_pieces(expr, constants).strip()
+        sql = (_resolve_string_expr(expr, constants) or "").strip()
         if sql and _looks_like_sql(sql):
             fragments.append(normalize_embedded_sql(sql))
 
@@ -1074,7 +1105,7 @@ def extract_java_sql(text: str) -> list[str]:
         args = _split_top_level(blob)
         if not args:
             continue
-        sql = _string_pieces(args[0], constants).strip()
+        sql = (_resolve_string_expr(args[0], constants) or "").strip()
         if sql and _looks_like_sql(sql):
             fragments.append(normalize_embedded_sql(sql))
 
@@ -1089,30 +1120,51 @@ def mybatis_mapper_target(path: str) -> bool:
     return bool(text and _MYBATIS_HINT_RE.search(text))
 
 
-def _mybatis_flatten(el, sql_fragments: dict) -> str:
+class _MybatisIncomplete(Exception):
+    """The statement cannot be flattened faithfully (unresolvable or cyclic
+    <include>): skip it rather than analyze made-up SQL."""
+
+
+def _mybatis_flatten(el, sql_fragments: dict, stack: tuple = ()) -> str:
     """Best-effort flattening of MyBatis dynamic SQL to one analyzable branch:
-    <if>/<trim>/<foreach>/<when> keep their content, <choose> keeps only its
-    first <when>, <where>/<set> become the keyword, <include> resolves through
-    the mapper's <sql> fragments, <bind> disappears."""
+    <if>/<when> keep their content, <choose> keeps only its first <when>,
+    <where>/<set> become the keyword, <trim>/<foreach> honor their
+    prefix/open/close attributes, <include> resolves through the mapper's
+    <sql> fragments, <bind>/<selectKey> disappear (selectKey is its own
+    statement, not part of the parent's SQL)."""
     parts = [el.text or ""]
     for child in el:
         tag = child.tag.lower() if isinstance(child.tag, str) else ""
         if tag == "choose":
             when = next((c for c in child if isinstance(c.tag, str) and c.tag.lower() == "when"), None)
-            parts.append(_mybatis_flatten(when, sql_fragments) if when is not None else "")
+            parts.append(_mybatis_flatten(when, sql_fragments, stack) if when is not None else "")
         elif tag == "include":
-            frag = sql_fragments.get(child.get("refid", ""))
-            parts.append(_mybatis_flatten(frag, sql_fragments) if frag is not None else "")
-        elif tag == "bind":
+            refid = child.get("refid", "")
+            frag = sql_fragments.get(refid)
+            if frag is None or refid in stack:
+                raise _MybatisIncomplete(refid or "include")
+            parts.append(_mybatis_flatten(frag, sql_fragments, stack + (refid,)))
+        elif tag in ("bind", "selectkey"):
             pass
         elif tag == "where":
-            inner = _mybatis_flatten(child, sql_fragments).strip()
+            inner = _mybatis_flatten(child, sql_fragments, stack).strip()
             parts.append(" WHERE " + re.sub(r"^(AND|OR)\b", "", inner, flags=re.I).strip())
         elif tag == "set":
-            inner = _mybatis_flatten(child, sql_fragments).strip().rstrip(",")
+            inner = _mybatis_flatten(child, sql_fragments, stack).strip().rstrip(",")
             parts.append(" SET " + inner)
+        elif tag == "trim":
+            inner = _mybatis_flatten(child, sql_fragments, stack).strip()
+            for override in (child.get("prefixOverrides") or "").split("|"):
+                override = override.strip()
+                if override and re.match(re.escape(override), inner, re.I):
+                    inner = inner[len(override):].lstrip()
+                    break
+            parts.append(f" {child.get('prefix', '')} {inner} {child.get('suffix', '')} ")
+        elif tag == "foreach":
+            inner = _mybatis_flatten(child, sql_fragments, stack).strip()
+            parts.append(f" {child.get('open', '')}{inner}{child.get('close', '')} ")
         else:
-            parts.append(_mybatis_flatten(child, sql_fragments))
+            parts.append(_mybatis_flatten(child, sql_fragments, stack))
         parts.append(child.tail or "")
     return "".join(parts)
 
@@ -1132,7 +1184,12 @@ def extract_mybatis_sql(text: str) -> tuple[list[str], bool]:
     for el in root.iter():
         if not (isinstance(el.tag, str) and el.tag.lower() in _MYBATIS_STATEMENT_TAGS):
             continue
-        body = _mybatis_flatten(el, sql_fragments)
+        try:
+            body = _mybatis_flatten(el, sql_fragments)
+        except _MybatisIncomplete as exc:
+            info(f"mapper statement id={el.get('id', '?')} skipped: unresolvable <include refid=\"{exc}\"> "
+                 f"(cross-mapper or cyclic)")
+            continue
         body = substitute_flyway_placeholders(body, {})  # ${col} -> col, same token rule
         body = normalize_embedded_sql(body)
         body = re.sub(r"\s+", " ", body).strip()
@@ -1230,10 +1287,11 @@ def extract_migration(path: str, opts: argparse.Namespace) -> Optional[tuple[str
         sql = ";\n".join(f.rstrip().rstrip(";") for f in fragments) + (";" if fragments else "")
         manual = None
         if uses_dollar:
-            finding, section = _manual_review(path, _MYBATIS_DOLLAR_DESC, "mybatis-string-interpolation",
-                                              _MYBATIS_DOLLAR_SECTION)
-            finding.severity = "Medium"
-            manual = (finding, section)
+            # Info like every local flag: a local severity can't gate
+            # consistently across api modes (v1's server worst_severity is
+            # authoritative), so it informs rather than pretending to block.
+            manual = _manual_review(path, _MYBATIS_DOLLAR_DESC, "mybatis-string-interpolation",
+                                    _MYBATIS_DOLLAR_SECTION)
         return sql, manual
     if path.endswith(".sql"):
         base = os.path.basename(path)
