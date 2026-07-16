@@ -31,15 +31,26 @@ database with Connect Pro.
    CI/CD variable `SIXTA_API_KEY` (Settings → CI/CD → Variables).
 2. Optional, for MR comments: create a project access token (`api` scope,
    Reporter role) and store it as `SIXTA_BOT_TOKEN`. `CI_JOB_TOKEN` cannot post notes.
-3. Add to `.gitlab-ci.yml` (GitLab ≥ 16.6, remote includes with inputs):
+3. Add to `.gitlab-ci.yml` — as a [CI/CD component](https://gitlab.com/explore/catalog)
+   (recommended; `@0.4` auto-picks-up patch releases):
+
+```yaml
+include:
+  - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.4
+    inputs:
+      engine_version: "16"                      # match production; verdicts are version-dependent
+      setup: pip install -r requirements.txt    # whatever makes manage.py runnable
+      allow_failure: true                       # soak period; remove to enforce
+```
+
+   Or, on self-managed instances without access to the gitlab.com catalog, as a
+   remote include (GitLab ≥ 16.6):
 
 ```yaml
 include:
   - remote: "https://raw.githubusercontent.com/sixta-systems/sixta-ci/v1/templates/sixta-review.yml"
     inputs:
-      engine_version: "16"                      # match production; verdicts are version-dependent
-      setup: pip install -r requirements.txt    # whatever makes manage.py runnable
-      allow_failure: true                       # soak period; remove to enforce
+      engine_version: "16"
 ```
 
 4. Make sure **merge request pipelines** are running in your project. The job

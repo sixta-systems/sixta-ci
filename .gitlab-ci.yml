@@ -1,0 +1,42 @@
+# Pipeline for the component project itself: validate, smoke-test, release.
+#
+# Publishing to the CI/CD Catalog happens via the create-release job below,
+# triggered by pushing a semver tag (e.g. 0.4.3). Catalog releases MUST be
+# pure semantic versions — no "v" prefix (GitHub tags stay v-prefixed;
+# mirror them here without the v).
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Including our own component at the current SHA validates the spec and
+# interpolation on every pipeline. The sixta-review job itself only runs in
+# merge-request pipelines (per its rules), which also serves as a live test:
+# any MR to this repo that touches SQL/migrations gets reviewed by the
+# component under change.
+include:
+  - component: $CI_SERVER_FQDN/$CI_PROJECT_PATH/sixta-review@$CI_COMMIT_SHA
+    inputs:
+      allow_failure: true
+
+stages: [test, release]
+
+smoke:
+  stage: test
+  image: python:3.13
+  script:
+    - python -m py_compile sixta_review.py
+    - python -c "import ast; ast.parse(open('sixta_review.py').read())"
+
+create-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+  script:
+    - echo "Publishing sixta-ci $CI_COMMIT_TAG to the CI/CD Catalog"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "sixta-ci $CI_COMMIT_TAG — SQL and DDL review for merge requests. Changelog: https://github.com/sixta-systems/sixta-ci/releases"

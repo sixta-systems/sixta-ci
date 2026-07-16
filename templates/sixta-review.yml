@@ -1,13 +1,21 @@
-# sixta-review — GitLab CI job template (SIXTA Connect SQL review for Django).
+# sixta-review — GitLab CI job template (SIXTA Connect SQL review for Django,
+# Alembic, Flyway/Liquibase, and plain .sql).
 #
-# Hosted on GitHub; consume with `include: remote:` (inputs work with remote
-# includes on GitLab >= 16.6):
+# Preferred: consume as a CI/CD component from the catalog
+# (gitlab.com/explore/catalog):
 #
 #   include:
-#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.4.2/templates/sixta-review.yml'
+#     - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.4
 #       inputs:
 #         engine_version: "16"        # match production!
 #         setup: pip install -r requirements.txt
+#
+# Also works as a plain remote include (GitLab >= 16.6, e.g. self-managed
+# instances without the mirrored component project):
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.4.2/templates/sixta-review.yml'
+#       inputs: { engine_version: "16" }
 #
 # Required CI/CD variables (Settings -> CI/CD -> Variables, masked):
 #   SIXTA_API_KEY     free key from connect.sixta.ai/portal
@@ -18,6 +26,12 @@
 # (and raw.githubusercontent.com for the script fetch).
 
 spec:
+  description: >-
+    Reviews SQL and schema migrations in merge requests like a DBA would.
+    Blocks unsafe changes (lock analysis, rollback audit), posts the safe
+    rewrite as an MR comment, uploads inline Code Quality findings, and
+    gates on severity. Django, Alembic, Flyway, Liquibase, and plain .sql.
+    Free API key from connect.sixta.ai.
   inputs:
     stage:
       default: test
