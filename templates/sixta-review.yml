@@ -27,11 +27,10 @@
 
 spec:
   description: >-
-    Reviews SQL and schema migrations in merge requests like a DBA would.
-    Blocks unsafe changes (lock analysis, rollback audit), posts the safe
-    rewrite as an MR comment, uploads inline Code Quality findings, and
-    gates on severity. Django, Alembic, Flyway, Liquibase, and plain .sql.
-    Free API key from connect.sixta.ai.
+    Reviews SQL and schema migrations in MRs like a DBA would. Blocks unsafe
+    changes, posts the safe rewrite and rollback audit as an MR comment, and
+    gates on severity. Django, Alembic, Flyway, Liquibase, plain .sql. Free
+    key from connect.sixta.ai.
   inputs:
     stage:
       default: test
