@@ -1891,9 +1891,15 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         request: dict = {"engine": opts.engine, "options": options, "extractions": extractions}
         if opts.engine_version:
             request["version"] = opts.engine_version
+        context_block: dict = {}
         rref = repo_ref()
         if rref:
-            request["context"] = {"repo_ref": rref}  # repo→connection routing (Connect Pro)
+            context_block["repo_ref"] = rref  # repo→connection routing (Connect Pro)
+        op = operator_identity()
+        if op:
+            context_block["operator"] = op  # author credit on the review record (hashed server-side)
+        if context_block:
+            request["context"] = context_block
         schema = capture_schema(opts)
         if schema:
             request["schema"] = {"format": "ddl", "content": schema}
@@ -2155,6 +2161,27 @@ def repo_ref() -> str | None:
     ref = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("CI_PROJECT_PATH")
     ref = (ref or "").strip()
     return ref[:256] or None
+
+
+def operator_identity() -> str | None:
+    """The change author's identity, sent as ``context.operator`` so the server
+    can credit this review to the author's personal review record. The server
+    stores only a salted hash of it, never the raw value (see the SIXTA data
+    handling statement). CI only: GitLab sets GITLAB_USER_EMAIL; on GitHub
+    Actions the checkout's HEAD author email is used. Outside CI (or with
+    SIXTA_NO_ATTRIBUTION=1) nothing is resolved and the batch is unattributed;
+    the account's per-key opt-out also disables it server-side."""
+    if os.environ.get("SIXTA_NO_ATTRIBUTION") == "1":
+        return None
+    op = (os.environ.get("GITLAB_USER_EMAIL") or "").strip()
+    if not op and os.environ.get("GITHUB_ACTIONS") == "true":
+        try:
+            lines = _git("log", "-1", "--pretty=%ae")
+            op = lines[0] if lines else ""
+        except Exception:
+            op = ""
+    op = op.strip()
+    return op[:256] or None
 
 
 def github_base_sha() -> Optional[str]:

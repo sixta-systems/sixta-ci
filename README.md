@@ -248,6 +248,16 @@ rollback info (unchecked, noted in the job log) and the review continues: the
 audit never fails the run. MCP mode skips the audit entirely, since the MCP
 tools carry no rollback parameter; the rollback audit is `v1` only.
 
+## Author attribution
+
+In `v1` batch mode the kit names the change author alongside the batch
+(`context.operator`), so SIXTA can credit the review to that person's private
+review record on connect.sixta.ai. GitLab: `GITLAB_USER_EMAIL`. GitHub Actions:
+the checkout's HEAD commit author email. **The server stores only a salted hash
+of the identity, never the raw value** (see the SIXTA data handling statement);
+outside CI nothing is resolved, so local runs are never attributed. Opt out per
+run with `SIXTA_NO_ATTRIBUTION=1`, or per key on the portal's Keys page.
+
 ## Inputs
 
 Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
