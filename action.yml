@@ -31,6 +31,9 @@ inputs:
   require_rollback:
     description: "v1 only. true raises the no-rollback finding to gate-able severity. Leave false for roll-forward-only policies."
     default: "false"
+  badge:
+    description: "Append the 'reviewed by SIXTA' footer badge to PR comments. Turning it off is a Connect Pro setting, confirmed via the v1 API."
+    default: "true"
   schema_cmd:
     description: "v1 only — command whose stdout is the shared schema DDL (default pg_dump --schema-only when a DB is configured)."
     default: ""
@@ -60,7 +63,7 @@ inputs:
     default: "3.13"
   script_ref:
     description: "Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag."
-    default: "v0.4.3"
+    default: "v0.5.0"
 
 runs:
   using: "composite"
@@ -86,6 +89,7 @@ runs:
         SIXTA_FAIL_MODE: ${{ inputs.fail_mode }}
         SIXTA_API: ${{ inputs.api }}
         SIXTA_REQUIRE_ROLLBACK: ${{ inputs.require_rollback }}
+        SIXTA_BADGE: ${{ inputs.badge }}
         SIXTA_SCHEMA_CMD: ${{ inputs.schema_cmd }}
         SIXTA_URL: ${{ inputs.sixta_url }}
         SIXTA_MANAGE_PY: ${{ inputs.manage_py }}

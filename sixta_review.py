@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NoReturn, Optional
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 DEFAULT_SIXTA_URL = "https://connect.sixta.ai/mcp"
 REPORT_MD = "sixta-report.md"
@@ -1882,6 +1882,7 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
     server_renders = None
     context = None
     server_worst = None
+    badge_info = None
     if extractions:
         render = ["markdown", "sarif"] if getattr(opts, "platform", "gitlab") == "github" else ["markdown", "code-quality"]
         options: dict = {"render": render}
@@ -1904,10 +1905,10 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
             response = client.analyze_v1(request)
         except SixtaConnectivityError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA unreachable — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None, None, None
+            return [reports[p] for p in order], None, None, None, None
         except SixtaToolError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA error — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None, None, None
+            return [reports[p] for p in order], None, None, None, None
 
         _apply_v1_results(response, ext_owner, reports, opts, extractions)
         renders = response.get("renders")
@@ -1918,8 +1919,10 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         context = ctx if isinstance(ctx, dict) else {"source": "none"}
         ws = response.get("worst_severity")
         server_worst = ws if ws in SEVERITY_RANK else None
+        bd = response.get("badge")
+        badge_info = bd if isinstance(bd, dict) else None
 
-    return [reports[p] for p in order], server_renders, context, server_worst
+    return [reports[p] for p in order], server_renders, context, server_worst, badge_info
 
 
 def _batch_failed(reports: dict, ext_owner: list, opts: argparse.Namespace, msg: str, exc: Exception) -> None:
@@ -1983,7 +1986,51 @@ def _apply_v1_results(response: dict, ext_owner: list, reports: dict, opts: argp
 # Outputs
 # --------------------------------------------------------------------------
 
-def render_markdown(reports: list[FileReport], gate: str, context: dict | None = None) -> str:
+def badge_origin(sixta_url: str) -> str:
+    """The web origin for badge assets and links, derived from the configured
+    MCP/API URL so a self-hosted server brands with its own host."""
+    raw = sixta_url if "://" in sixta_url else f"https://{sixta_url}"
+    parts = urllib.parse.urlsplit(raw)
+    return f"{parts.scheme}://{parts.netloc}" if parts.netloc else "https://connect.sixta.ai"
+
+
+def badge_footer_line(opts: argparse.Namespace, badge_info: Optional[dict]) -> Optional[str]:
+    """The comment/note footer badge. On by default; turning it off is a
+    Connect Pro entitlement, confirmed by ``badge.removable`` in the /v1
+    response (mcp mode has no entitlement channel, so the opt-out needs
+    SIXTA_API=v1). The footer is always the neutral "reviewed by SIXTA" —
+    verdicts live in the report above it, never in the footer."""
+    base = badge_origin(opts.sixta_url)
+    if not opts.badge:
+        if badge_info is not None and badge_info.get("removable"):
+            return None
+        if opts.api == "v1":
+            info(f"badge=false is a Connect Pro setting — keeping the footer ({base}/pricing)")
+        else:
+            info("badge=false needs the v1 API to confirm the Connect Pro entitlement — keeping the footer (set SIXTA_API=v1)")
+    return f"[![Reviewed by SIXTA]({base}/badge.svg)]({base}/ci?utm_source=badge&utm_medium=pr_comment)"
+
+
+def badge_snippet(badge_info: Optional[dict], sixta_url: str) -> Optional[str]:
+    """The copy-paste README badge offer for the job summary/log: live per-repo
+    counters behind the unguessable slug URL the server minted. Never added to
+    the PR/MR comment itself (it would repeat on every run)."""
+    url = (badge_info or {}).get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    base = badge_origin(sixta_url)
+    return "\n".join([
+        "**Add the SIXTA badge to your README**",
+        "",
+        "Live counters for this repository, updated after every gated run:",
+        "",
+        "```markdown",
+        f"[![Reviewed by SIXTA]({url})]({base}/ci?utm_source=badge&utm_medium=readme)",
+        "```",
+    ])
+
+
+def render_markdown(reports: list[FileReport], gate: str, context: dict | None = None, badge_footer: str | None = None) -> str:
     lines = [NOTE_MARKER, "## SIXTA SQL review", ""]
     total = sum(len(r.findings) for r in reports)
     worst = worst_rank(reports)
@@ -2040,6 +2087,8 @@ def render_markdown(reports: list[FileReport], gate: str, context: dict | None =
             lines += [s, ""]
         for s in r.skipped:
             lines += [f"> ⚠️ {s}", ""]
+    if badge_footer:
+        lines += ["", badge_footer]
     return "\n".join(lines)
 
 
@@ -2257,6 +2306,14 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_flag_on(name: str, default: bool = True) -> bool:
+    """Like _env_flag but default-ON: unset/empty means True."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sixta-review", description=__doc__.split("\n\n")[0])
     p.add_argument("files", nargs="*", help="explicit files to review (default: git diff discovery)")
@@ -2276,6 +2333,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-rollback", action="store_true", default=_env_flag("SIXTA_REQUIRE_ROLLBACK"),
                    help="v1 only: raise the server's no-rollback finding to gate-able severity "
                         "(the rollback audit itself always runs in v1 mode)")
+    p.add_argument("--badge", action=argparse.BooleanOptionalAction, default=_env_flag_on("SIXTA_BADGE"),
+                   help="append the 'reviewed by SIXTA' footer badge to PR/MR comments (default on; "
+                        "turning it off is a Connect Pro setting, confirmed via the v1 API)")
     p.add_argument("--sixta-url", default=os.environ.get("SIXTA_URL", DEFAULT_SIXTA_URL))
     p.add_argument("--manage-py", default=os.environ.get("SIXTA_MANAGE_PY", "manage.py"))
     p.add_argument("--alembic-config", default=os.environ.get("SIXTA_ALEMBIC_CONFIG", "alembic.ini"),
@@ -2312,6 +2372,7 @@ def _auth_failed(opts: argparse.Namespace, exc: SixtaAuthError) -> int:
         warn(f"SIXTA rejected the API key: {exc}")
         warn("skipping SIXTA analysis for this commit — fix SIXTA_API_KEY to re-enable")
         return 0
+    footer = badge_footer_line(opts, None)
     markdown = "\n".join([
         NOTE_MARKER,
         "## SIXTA SQL review",
@@ -2320,7 +2381,7 @@ def _auth_failed(opts: argparse.Namespace, exc: SixtaAuthError) -> int:
         "",
         "Findings for this revision are unknown — fix the key and re-run the pipeline.",
         "",
-    ])
+    ] + ([footer, ""] if footer else []))
     with open(opts.report_md, "w", encoding="utf-8") as fh:
         fh.write(markdown)
     _write_empty_artifacts(opts)
@@ -2361,27 +2422,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     server_renders = None
     v1_context = None
     server_worst = None
+    badge_info = None
     try:
         if opts.api == "v1":
-            reports, server_renders, v1_context, server_worst = run_v1(files, opts, client, hints)
+            reports, server_renders, v1_context, server_worst, badge_info = run_v1(files, opts, client, hints)
         else:
             reports = analyze_files(files, opts, client, hints)
     except SixtaAuthError as exc:
         return _auth_failed(opts, exc)
     append_ddl_auto_note(reports)
-    markdown = render_markdown(reports, opts.gate, v1_context)
+    # No footer on local pre-commit output — the badge is for public surfaces.
+    footer = badge_footer_line(opts, badge_info) if not opts.local else None
+    markdown = render_markdown(reports, opts.gate, v1_context, footer)
 
     if opts.local:
         print(markdown.replace(NOTE_MARKER + "\n", ""))
     else:
         with open(opts.report_md, "w", encoding="utf-8") as fh:
             fh.write(markdown)
+        # The README-badge offer (v1 keyed runs only: the server minted a slug
+        # URL). Job summary/log only, never the PR/MR comment.
+        snippet = badge_snippet(badge_info, opts.sixta_url)
         if opts.platform == "github":
             # Prefer the server-rendered SARIF (the /v1 path); fall back to
             # building it locally from findings (mcp mode or an older server).
             sarif = server_renders.get("sarif") if isinstance(server_renders, dict) else None
             write_sarif(sarif if isinstance(sarif, dict) else build_sarif(reports), opts.sarif)
-            write_github_summary(markdown)
+            write_github_summary(markdown + (f"\n\n---\n\n{snippet}\n" if snippet else ""))
             upsert_github_comment(markdown)
         else:
             # Prefer the server-rendered GitLab code-quality JSON; fall back to
@@ -2392,6 +2459,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 write_code_quality(reports, opts.code_quality)
             upsert_mr_note(markdown)
+            if snippet:
+                # GitLab has no step summary; the job log carries the offer.
+                info("README badge available for this repository:\n" + snippet)
 
     gate_rank = GATE_RANK.get(opts.gate)
     if server_worst is not None:

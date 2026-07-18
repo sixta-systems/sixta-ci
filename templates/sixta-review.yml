@@ -5,7 +5,7 @@
 # (gitlab.com/explore/catalog):
 #
 #   include:
-#     - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.4
+#     - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.5
 #       inputs:
 #         engine_version: "16"        # match production!
 #         setup: pip install -r requirements.txt
@@ -14,7 +14,7 @@
 # instances without the mirrored component project):
 #
 #   include:
-#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.4.3/templates/sixta-review.yml'
+#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.5.0/templates/sixta-review.yml'
 #       inputs: { engine_version: "16" }
 #
 # Required CI/CD variables (Settings -> CI/CD -> Variables, masked):
@@ -72,13 +72,17 @@ spec:
       type: boolean
       default: false
       description: v1 only. true raises the no-rollback finding to gate-able severity. Leave false for roll-forward-only policies.
+    badge:
+      type: boolean
+      default: true
+      description: Append the 'reviewed by SIXTA' footer badge to MR comments. Turning it off is a Connect Pro setting, confirmed via the v1 API (set api to v1).
     liquibase_cmd:
       default: "liquibase"
       description: Liquibase CLI for offline changelog rendering (update-sql). Install it via `setup` when using XML/YAML/JSON changelogs; SQL-format changelogs need no CLI.
     sixta_url:
       default: "https://connect.sixta.ai/mcp"
     script_ref:
-      default: "v0.4.3"
+      default: "v0.5.0"
       description: Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag.
     postgres_image:
       default: "postgres:16"
@@ -114,6 +118,7 @@ sixta-review:
     SIXTA_ENGINE_VERSION: $[[ inputs.engine_version ]]
     SIXTA_API: $[[ inputs.api ]]
     SIXTA_REQUIRE_ROLLBACK: $[[ inputs.require_rollback ]]
+    SIXTA_BADGE: $[[ inputs.badge ]]
     SIXTA_SCHEMA_CMD: $[[ inputs.schema_cmd ]]
     SIXTA_GATE: $[[ inputs.gate ]]
     SIXTA_FAIL_MODE: $[[ inputs.fail_mode ]]
