@@ -337,3 +337,18 @@ pytest            # unit + stub-server integration tests (GitLab + GitHub), no n
 
 Both wrappers fetch `sixta_review.py` (stdlib-only, single file) from this repo
 at `script_ref`. Releases are git tags; the template + action defaults pin them.
+
+### Releasing (keep GitHub and GitLab in sync)
+
+GitHub (`origin`) is where users and the Action fetch from; GitLab (`gitlab`)
+publishes the CI/CD Catalog component. `main` and the `v*` tags must match on
+both; the bare `X.Y.Z` tag is GitLab-only (it triggers the catalog release).
+
+1. Bump `__version__` and every pinned ref (action + template `script_ref`
+   defaults, README examples, pre-commit `rev`, catalog `@X.Y`).
+2. Merge to `main`, then `git push origin main && git push gitlab main`.
+3. `git tag -a vX.Y.Z && git tag -a X.Y.Z` (bare tag = catalog trigger).
+4. `git push origin vX.Y.Z && git push gitlab vX.Y.Z X.Y.Z`.
+5. Move the major tag: `git tag -f v1 && git push -f origin v1 && git push -f gitlab v1`.
+6. Publish the GitHub release notes on `vX.Y.Z`; confirm the GitLab tag
+   pipeline's `create-release` job published the catalog entry.
