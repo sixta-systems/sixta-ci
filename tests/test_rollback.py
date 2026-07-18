@@ -269,7 +269,7 @@ def test_no_rollback_findings_render_in_markdown_cq_and_sarif(stub_rollback_v1, 
     mig = tmp_path / "V7__add_index.sql"
     mig.write_text("CREATE INDEX i ON shop_order (status);")
     client = sr.SixtaClient(stub_rollback_v1, api_key=None)
-    reports, _renders, _context, _worst = sr.run_v1([str(mig)], _opts(require_rollback=True), client, hints={})
+    reports, _renders, _context, _worst, _badge = sr.run_v1([str(mig)], _opts(require_rollback=True), client, hints={})
 
     checks = sorted(f.check_name for r in reports for f in r.findings)
     assert checks == ["NO_ROLLBACK", "rollback:CREATE_INDEX"]

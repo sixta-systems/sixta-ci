@@ -1,5 +1,7 @@
 # sixta-ci
 
+[![Reviewed by SIXTA](https://connect.sixta.ai/badge.svg)](https://connect.sixta.ai/ci?utm_source=badge&utm_medium=readme)
+
 **DBRE-grade SQL review for Django, Alembic, and Flyway (Spring Boot) migrations
 and `.sql` files, in your GitLab merge requests and GitHub pull requests.**
 
@@ -32,11 +34,11 @@ database with Connect Pro.
 2. Optional, for MR comments: create a project access token (`api` scope,
    Reporter role) and store it as `SIXTA_BOT_TOKEN`. `CI_JOB_TOKEN` cannot post notes.
 3. Add to `.gitlab-ci.yml` — as a [CI/CD component](https://gitlab.com/explore/catalog)
-   (recommended; `@0.4` auto-picks-up patch releases):
+   (recommended; `@0.5` auto-picks-up patch releases):
 
 ```yaml
 include:
-  - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.4
+  - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.5
     inputs:
       engine_version: "16"                      # match production; verdicts are version-dependent
       setup: pip install -r requirements.txt    # whatever makes manage.py runnable
@@ -258,6 +260,7 @@ Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
 | `api` | `v1` (GitHub) / `mcp` (GitLab) | `v1` batches the whole run into one `POST /v1/analyze`. |
 | `schema_cmd` | none | `v1` only: command whose stdout is the shared schema DDL (default `pg_dump` when a DB is configured). |
 | `require_rollback` | `false` | `v1` only: raise the "no rollback prepared" finding to gate-able severity. See "Rollback audit". |
+| `badge` | `true` | Append the "reviewed by SIXTA" footer badge to the PR/MR comment. Turning it off is a Connect Pro setting, confirmed via the `v1` API. See "The badge". |
 | `setup` / `manage_py` | `pip install -r requirements.txt` / `manage.py` | Reuse your test job's environment. Leave `setup` empty for `.sql`-only repos. |
 | `sixta_url` | `https://connect.sixta.ai/mcp` | SIXTA endpoint. |
 
@@ -266,6 +269,23 @@ GitHub-only: `working_directory` (monorepo subdir), `python_version`, `sarif`
 (output path), `script_ref`. The GitHub PR comment uses the built-in
 `GITHUB_TOKEN` (grant `pull-requests: write`); the SARIF upload needs
 `security-events: write`.
+
+## The badge
+
+Every PR/MR comment ends with a small "reviewed by SIXTA" badge. It is always
+neutral: verdicts live in the report above it, never in the footer.
+
+There is also a per-repository README badge with live counters ("0 unsafe
+migrations approved"), updated after every gated `v1` run. The job step summary
+(GitHub) or job log (GitLab) prints a ready-made snippet with your repo's badge
+URL after each run; paste it into your README. The URL is keyed by an
+unguessable random slug the server mints for your repo, so the counters only
+become public if you choose to publish the badge. Your repository name never
+appears in the URL.
+
+Turning the comment footer off (`badge: false`) is a Connect Pro setting. The
+server confirms the entitlement in the `v1` response, so on GitLab set
+`api: v1` as well.
 
 ## Table-size hints (`.sixta.yml`)
 
@@ -283,7 +303,7 @@ Same verdicts before the push, via the [pre-commit](https://pre-commit.com) fram
 ```yaml
 repos:
   - repo: https://github.com/sixta-systems/sixta-ci
-    rev: v0.4.3
+    rev: v0.5.0
     hooks:
       - id: sixta-review
 ```
