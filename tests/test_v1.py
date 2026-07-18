@@ -1,6 +1,7 @@
 """Tests for the /v1/analyze batch mode (stub REST server, no network)."""
 
 import json
+import subprocess
 from http.server import BaseHTTPRequestHandler
 
 import pytest
@@ -238,8 +239,8 @@ def test_run_v1_passes_schema_and_hints(stub_v1, tmp_path, monkeypatch):
 
 def _clear_ci_env(monkeypatch):
     """Hermetic CI context: these tests assert exact context blocks, so the
-    real CI env (GITHUB_ACTIONS, GITLAB_USER_EMAIL) must not leak in."""
-    for var in ("GITHUB_REPOSITORY", "CI_PROJECT_PATH", "GITLAB_USER_EMAIL", "GITHUB_ACTIONS", "SIXTA_NO_ATTRIBUTION"):
+    real CI env (GITHUB_ACTIONS, GITLAB_CI, GITLAB_USER_EMAIL) must not leak in."""
+    for var in ("GITHUB_REPOSITORY", "CI_PROJECT_PATH", "GITLAB_CI", "GITLAB_USER_EMAIL", "GITHUB_ACTIONS", "SIXTA_NO_ATTRIBUTION"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -266,9 +267,11 @@ def test_run_v1_omits_context_without_ci_repo(stub_v1, tmp_path, monkeypatch):
 
 def test_run_v1_sends_operator_from_gitlab_env(stub_v1, tmp_path, monkeypatch):
     # GitLab names the change author directly; sent verbatim (trimmed) — the
-    # server stores only a salted hash of it.
+    # server stores only a salted hash of it. Honored only on a real runner
+    # (GITLAB_CI), so a stray env var locally never attributes a run.
     _clear_ci_env(monkeypatch)
     monkeypatch.setenv("CI_PROJECT_PATH", "org/app-1")
+    monkeypatch.setenv("GITLAB_CI", "true")
     monkeypatch.setenv("GITLAB_USER_EMAIL", " Jane@Acme.com ")
     sql = tmp_path / "c.sql"
     sql.write_text("CREATE INDEX i ON shop_order (status);")
@@ -277,13 +280,50 @@ def test_run_v1_sends_operator_from_gitlab_env(stub_v1, tmp_path, monkeypatch):
     assert StubV1Handler.calls[0]["request"]["context"] == {"repo_ref": "org/app-1", "operator": "Jane@Acme.com"}
 
 
-def test_run_v1_operator_from_github_head_author(stub_v1, tmp_path, monkeypatch):
-    # GitHub Actions exposes no author email in env; the checkout's HEAD author
-    # is the change author for the PR head.
+def test_run_v1_gitlab_email_ignored_outside_gitlab_ci(stub_v1, tmp_path, monkeypatch):
+    # GITLAB_USER_EMAIL exported by a local shell / dotfiles must NOT attribute:
+    # the published promise is that local runs never send an identity.
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setenv("CI_PROJECT_PATH", "org/app-1")
+    monkeypatch.setenv("GITLAB_USER_EMAIL", "jane@acme.com")
+    sql = tmp_path / "c.sql"
+    sql.write_text("CREATE INDEX i ON shop_order (status);")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    sr.run_v1([str(sql)], _opts(), client, hints={})
+    assert StubV1Handler.calls[0]["request"]["context"] == {"repo_ref": "org/app-1"}
+
+
+def test_run_v1_operator_github_pr_head_author_not_merge_commit(stub_v1, tmp_path, monkeypatch):
+    # pull_request events check out GitHub's synthetic merge commit; the change
+    # author is HEAD^2's author, not HEAD's.
     _clear_ci_env(monkeypatch)
     monkeypatch.setenv("GITHUB_REPOSITORY", "org/app-1")
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    monkeypatch.setattr(sr, "_git", lambda *a: ["dev@acme.com"])
+
+    def fake_git(*args):
+        return ["dev@acme.com"] if args[-1] == "HEAD^2" else ["noreply@github.com"]
+
+    monkeypatch.setattr(sr, "_git", fake_git)
+    sql = tmp_path / "c.sql"
+    sql.write_text("CREATE INDEX i ON shop_order (status);")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    sr.run_v1([str(sql)], _opts(), client, hints={})
+    assert StubV1Handler.calls[0]["request"]["context"]["operator"] == "dev@acme.com"
+
+
+def test_run_v1_operator_github_falls_back_to_head_on_non_merge(stub_v1, tmp_path, monkeypatch):
+    # push events check out a plain commit (HEAD^2 does not exist): the HEAD
+    # author is the change author.
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "org/app-1")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+
+    def fake_git(*args):
+        if args[-1] == "HEAD^2":
+            raise subprocess.CalledProcessError(1, "git")
+        return ["dev@acme.com"]
+
+    monkeypatch.setattr(sr, "_git", fake_git)
     sql = tmp_path / "c.sql"
     sql.write_text("CREATE INDEX i ON shop_order (status);")
     client = sr.SixtaClient(stub_v1, api_key=None)
@@ -292,12 +332,14 @@ def test_run_v1_operator_from_github_head_author(stub_v1, tmp_path, monkeypatch)
 
 
 def test_run_v1_attribution_opt_out_and_non_ci(stub_v1, tmp_path, monkeypatch):
-    # SIXTA_NO_ATTRIBUTION=1 suppresses the operator even when CI names one,
-    # and outside CI the git fallback never runs (no local-dev attribution).
+    # SIXTA_NO_ATTRIBUTION suppresses the operator even when CI names one
+    # (any accepted flag spelling, via _env_flag), and outside CI the git
+    # fallback never runs (no local-dev attribution).
     _clear_ci_env(monkeypatch)
     monkeypatch.setenv("CI_PROJECT_PATH", "org/app-1")
+    monkeypatch.setenv("GITLAB_CI", "true")
     monkeypatch.setenv("GITLAB_USER_EMAIL", "jane@acme.com")
-    monkeypatch.setenv("SIXTA_NO_ATTRIBUTION", "1")
+    monkeypatch.setenv("SIXTA_NO_ATTRIBUTION", "true")
     sql = tmp_path / "c.sql"
     sql.write_text("CREATE INDEX i ON shop_order (status);")
     client = sr.SixtaClient(stub_v1, api_key=None)
@@ -305,6 +347,7 @@ def test_run_v1_attribution_opt_out_and_non_ci(stub_v1, tmp_path, monkeypatch):
     assert StubV1Handler.calls[0]["request"]["context"] == {"repo_ref": "org/app-1"}
 
     monkeypatch.delenv("SIXTA_NO_ATTRIBUTION")
+    monkeypatch.delenv("GITLAB_CI")
     monkeypatch.delenv("GITLAB_USER_EMAIL")
     monkeypatch.delenv("CI_PROJECT_PATH")
     # Outside CI: even inside a git repo, operator_identity resolves nothing.

@@ -252,11 +252,15 @@ tools carry no rollback parameter; the rollback audit is `v1` only.
 
 In `v1` batch mode the kit names the change author alongside the batch
 (`context.operator`), so SIXTA can credit the review to that person's private
-review record on connect.sixta.ai. GitLab: `GITLAB_USER_EMAIL`. GitHub Actions:
-the checkout's HEAD commit author email. **The server stores only a salted hash
-of the identity, never the raw value** (see the SIXTA data handling statement);
-outside CI nothing is resolved, so local runs are never attributed. Opt out per
-run with `SIXTA_NO_ATTRIBUTION=1`, or per key on the portal's Keys page.
+review record on connect.sixta.ai. GitLab: `GITLAB_USER_EMAIL`, honored only on
+a real runner (`GITLAB_CI`). GitHub Actions: the change author's commit email,
+read from `HEAD^2` on pull_request runs (the checkout is GitHub's synthetic
+merge commit, whose own author is not the change author) and from `HEAD` on
+push runs. **The server stores only a salted hash of the identity, never the
+raw value** (see the SIXTA data handling statement); outside CI nothing is
+resolved, so local runs are never attributed. Opt out per run with
+`SIXTA_NO_ATTRIBUTION=1` (or `true`/`yes`/`on`), per key on the portal's Keys
+page, or account-wide with "Pause my record" there.
 
 ## Inputs
 

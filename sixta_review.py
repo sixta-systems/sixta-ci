@@ -2167,19 +2167,29 @@ def operator_identity() -> str | None:
     """The change author's identity, sent as ``context.operator`` so the server
     can credit this review to the author's personal review record. The server
     stores only a salted hash of it, never the raw value (see the SIXTA data
-    handling statement). CI only: GitLab sets GITLAB_USER_EMAIL; on GitHub
-    Actions the checkout's HEAD author email is used. Outside CI (or with
-    SIXTA_NO_ATTRIBUTION=1) nothing is resolved and the batch is unattributed;
-    the account's per-key opt-out also disables it server-side."""
-    if os.environ.get("SIXTA_NO_ATTRIBUTION") == "1":
+    handling statement). CI only, and each source is gated on its own runner
+    marker so a stray env var in a local shell can never attribute a run:
+    GITLAB_USER_EMAIL is honored only when GITLAB_CI confirms a real runner;
+    on GitHub Actions the author is the PR head's author email — HEAD^2,
+    because pull_request events check out GitHub's synthetic merge commit,
+    whose own author is not the change author — falling back to HEAD for
+    non-merge checkouts (push events). Outside CI (or with SIXTA_NO_ATTRIBUTION
+    set) nothing is resolved and the batch is unattributed; the account-level
+    and per-key pauses also disable it server-side."""
+    if _env_flag("SIXTA_NO_ATTRIBUTION"):
         return None
-    op = (os.environ.get("GITLAB_USER_EMAIL") or "").strip()
+    op = ""
+    if os.environ.get("GITLAB_CI") == "true":
+        op = (os.environ.get("GITLAB_USER_EMAIL") or "").strip()
     if not op and os.environ.get("GITHUB_ACTIONS") == "true":
-        try:
-            lines = _git("log", "-1", "--pretty=%ae")
-            op = lines[0] if lines else ""
-        except Exception:
-            op = ""
+        for ref in ("HEAD^2", "HEAD"):
+            try:
+                lines = _git("log", "-1", "--pretty=%ae", ref)
+            except Exception:
+                continue
+            if lines:
+                op = lines[0]
+                break
     op = op.strip()
     return op[:256] or None
 
