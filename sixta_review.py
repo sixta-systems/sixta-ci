@@ -2233,14 +2233,27 @@ def operator_identity() -> str | None:
     if os.environ.get("GITLAB_CI") == "true":
         op = (os.environ.get("GITLAB_USER_EMAIL") or "").strip()
     if not op and os.environ.get("GITHUB_ACTIONS") == "true":
-        for ref in ("HEAD^2", "HEAD"):
+        event = os.environ.get("GITHUB_EVENT_NAME", "")
+        if event.startswith("pull_request"):
+            # The checkout is GitHub's synthetic merge commit, so the change
+            # author is HEAD^2's author. A shallow checkout cannot resolve
+            # HEAD^2 — attribute nothing rather than the merge commit's
+            # author (the wrong person).
             try:
-                lines = _git("log", "-1", "--pretty=%ae", ref)
+                lines = _git("log", "-1", "--pretty=%ae", "HEAD^2")
+                op = lines[0] if lines else ""
             except Exception:
-                continue
-            if lines:
-                op = lines[0]
-                break
+                op = ""
+        else:
+            # push and other events check out the pushed commit itself; its
+            # author is the change author. Never HEAD^2 here: on a pushed
+            # merge commit that would credit the merged-in branch's tip
+            # author, a third party.
+            try:
+                lines = _git("log", "-1", "--pretty=%ae")
+                op = lines[0] if lines else ""
+            except Exception:
+                op = ""
     op = op.strip()
     return op[:256] or None
 

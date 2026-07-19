@@ -240,7 +240,7 @@ def test_run_v1_passes_schema_and_hints(stub_v1, tmp_path, monkeypatch):
 def _clear_ci_env(monkeypatch):
     """Hermetic CI context: these tests assert exact context blocks, so the
     real CI env (GITHUB_ACTIONS, GITLAB_CI, GITLAB_USER_EMAIL) must not leak in."""
-    for var in ("GITHUB_REPOSITORY", "CI_PROJECT_PATH", "GITLAB_CI", "GITLAB_USER_EMAIL", "GITHUB_ACTIONS", "SIXTA_NO_ATTRIBUTION"):
+    for var in ("GITHUB_REPOSITORY", "CI_PROJECT_PATH", "GITLAB_CI", "GITLAB_USER_EMAIL", "GITHUB_ACTIONS", "GITHUB_EVENT_NAME", "SIXTA_NO_ATTRIBUTION"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -299,6 +299,7 @@ def test_run_v1_operator_github_pr_head_author_not_merge_commit(stub_v1, tmp_pat
     _clear_ci_env(monkeypatch)
     monkeypatch.setenv("GITHUB_REPOSITORY", "org/app-1")
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
 
     def fake_git(*args):
         return ["dev@acme.com"] if args[-1] == "HEAD^2" else ["noreply@github.com"]
@@ -311,24 +312,46 @@ def test_run_v1_operator_github_pr_head_author_not_merge_commit(stub_v1, tmp_pat
     assert StubV1Handler.calls[0]["request"]["context"]["operator"] == "dev@acme.com"
 
 
-def test_run_v1_operator_github_falls_back_to_head_on_non_merge(stub_v1, tmp_path, monkeypatch):
-    # push events check out a plain commit (HEAD^2 does not exist): the HEAD
-    # author is the change author.
+def test_run_v1_operator_pr_shallow_checkout_attributes_nobody(stub_v1, tmp_path, monkeypatch):
+    # A shallow checkout cannot resolve HEAD^2 on a pull_request event: send
+    # nothing rather than the synthetic merge commit's author (wrong person).
     _clear_ci_env(monkeypatch)
     monkeypatch.setenv("GITHUB_REPOSITORY", "org/app-1")
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
 
     def fake_git(*args):
         if args[-1] == "HEAD^2":
             raise subprocess.CalledProcessError(1, "git")
-        return ["dev@acme.com"]
+        return ["noreply@github.com"]
 
     monkeypatch.setattr(sr, "_git", fake_git)
     sql = tmp_path / "c.sql"
     sql.write_text("CREATE INDEX i ON shop_order (status);")
     client = sr.SixtaClient(stub_v1, api_key=None)
     sr.run_v1([str(sql)], _opts(), client, hints={})
-    assert StubV1Handler.calls[0]["request"]["context"]["operator"] == "dev@acme.com"
+    assert "operator" not in StubV1Handler.calls[0]["request"]["context"]
+
+
+def test_run_v1_operator_push_uses_head_even_for_merge_commits(stub_v1, tmp_path, monkeypatch):
+    # push events (no GITHUB_EVENT_NAME=pull_request*) use HEAD's author — the
+    # pushed commit is the change. Never HEAD^2: on a pushed merge commit that
+    # would credit the merged-in branch's tip author, a third party.
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "org/app-1")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+
+    def fake_git(*args):
+        assert args[-1] != "HEAD^2", "push events must not consult HEAD^2"
+        return ["merger@acme.com"]
+
+    monkeypatch.setattr(sr, "_git", fake_git)
+    sql = tmp_path / "c.sql"
+    sql.write_text("CREATE INDEX i ON shop_order (status);")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    sr.run_v1([str(sql)], _opts(), client, hints={})
+    assert StubV1Handler.calls[0]["request"]["context"]["operator"] == "merger@acme.com"
 
 
 def test_run_v1_attribution_opt_out_and_non_ci(stub_v1, tmp_path, monkeypatch):
