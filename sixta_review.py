@@ -28,7 +28,11 @@ Wire protocol (two modes, selected by ``--api`` / ``SIXTA_API``):
   locally when the server does not render it (older ``/v1``). v1 mode also runs
   the rollback audit: each migration extraction carries the framework's own
   reverse render (or ``missing``/``irreversible``) for server-side analysis;
-  ``--require-rollback`` makes the no-rollback finding gate-able.
+  ``--require-rollback`` makes the no-rollback finding gate-able. Keyed v1 CI
+  runs also write the gate disposition back to ``POST /v1/outcome`` per change
+  (``gate_passed``/``gate_failed``, and ``acted_upon`` when a re-run of the
+  same PR shows a previously-failing change fixed), fire-and-forget so it can
+  never fail the pipeline; opt out with ``SIXTA_OUTCOMES=0``.
 
 Stdlib only. Python >= 3.9.
 """
@@ -66,6 +70,12 @@ V1_HINT_KEYS = ("size_bytes", "row_estimate", "has_foreign_keys", "has_triggers"
 CODE_QUALITY_JSON = "gl-code-quality-report.json"
 SARIF_JSON = "sixta.sarif"
 NOTE_MARKER = "<!-- sixta-review-report -->"
+# Gate state carried inside the upserted PR/MR comment (the only storage that
+# survives ephemeral CI runners and is per-PR by construction): the failing
+# change ids the next run of the same PR diffs against for acted-upon detection.
+STATE_MARKER = "<!-- sixta-ci:gate-state "
+STATE_MAX_ENTRIES = 50    # comment real estate; oldest failures beyond this are dropped
+OUTCOME_MAX_EVENTS = 100  # write-back cap per run (shares /v1's per-client rate bucket)
 
 SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}
 GATE_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": None}
@@ -380,6 +390,7 @@ class SixtaClient:
     def __init__(self, url: str, api_key: Optional[str], timeout: int = 60, max_retries: int = 3):
         self.url = url
         self.v1_url = v1_endpoint(url)
+        self.v1_outcome_url = self.v1_url[: -len("analyze")] + "outcome"
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
@@ -410,6 +421,22 @@ class SixtaClient:
                 _raise_http_error(exc, self.v1_url, authenticated=bool(self.api_key))
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
                 raise SixtaConnectivityError(f"POST {_redact_url(self.v1_url)} failed: {exc}") from exc
+
+    def report_outcome(self, change_id: str, kind: str, severity: Optional[str] = None) -> bool:
+        """POST one disposition to /v1/outcome (docs/v1-api.md). Single attempt,
+        short timeout, no retries: this is advisory write-back on the far side
+        of the gate decision, so the caller logs any failure and moves on.
+        Returns the server's ``recorded`` flag (False = the change_id is not
+        on record for this account)."""
+        body: dict = {"change_id": change_id, "kind": kind}
+        if severity:
+            body["severity"] = severity
+        headers = {"content-type": "application/json"}
+        if self.api_key:
+            headers["authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(self.v1_outcome_url, data=json.dumps(body).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=min(self.timeout, 15)) as resp:
+            return bool(json.loads(resp.read().decode()).get("recorded"))
 
     def _backoff_429(self, exc: urllib.error.HTTPError, label: str, attempt: int) -> bool:
         """Bounded backoff for an HTTP 429; True means the caller should retry."""
@@ -1823,13 +1850,16 @@ def _v1_table_hints(hints: dict) -> dict:
 
 def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hints: dict):
     """Analyze the whole changeset in one /v1/analyze POST. Returns
-    ``(reports, server_renders, context, server_worst)`` where server_renders
-    is the response's ``renders`` block (or None), used to prefer server-side
-    code-quality JSON, context is the response's ``context`` block (or None)
-    reporting where the production context came from (Connect Pro), and
-    server_worst is the response's ``worst_severity`` (or None). The server's
-    worst_severity is the authoritative gate input: it deliberately excludes
-    advisory findings (the ``rollback:*`` family informs but does not gate)."""
+    ``(reports, server_renders, context, server_worst, badge_info,
+    outcome_targets)`` where server_renders is the response's ``renders``
+    block (or None), used to prefer server-side code-quality JSON, context is
+    the response's ``context`` block (or None) reporting where the production
+    context came from (Connect Pro), server_worst is the response's
+    ``worst_severity`` (or None), and outcome_targets are the per-extraction
+    ``change_id`` records eligible for POST /v1/outcome write-back (keyed
+    responses only; empty otherwise). The server's worst_severity is the
+    authoritative gate input: it deliberately excludes advisory findings (the
+    ``rollback:*`` family informs but does not gate)."""
     reports: dict[str, FileReport] = {}
     order: list[str] = []
     extractions: list[dict] = []
@@ -1883,6 +1913,7 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
     context = None
     server_worst = None
     badge_info = None
+    outcome_targets: list[dict] = []
     if extractions:
         render = ["markdown", "sarif"] if getattr(opts, "platform", "gitlab") == "github" else ["markdown", "code-quality"]
         options: dict = {"render": render}
@@ -1911,12 +1942,13 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
             response = client.analyze_v1(request)
         except SixtaConnectivityError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA unreachable — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None, None, None, None
+            return [reports[p] for p in order], None, None, None, None, []
         except SixtaToolError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA error — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None, None, None, None
+            return [reports[p] for p in order], None, None, None, None, []
 
         _apply_v1_results(response, ext_owner, reports, opts, extractions)
+        outcome_targets = _outcome_targets(response, ext_owner)
         renders = response.get("renders")
         server_renders = renders if isinstance(renders, dict) else None
         ctx = response.get("context")
@@ -1928,7 +1960,26 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         bd = response.get("badge")
         badge_info = bd if isinstance(bd, dict) else None
 
-    return [reports[p] for p in order], server_renders, context, server_worst, badge_info
+    return [reports[p] for p in order], server_renders, context, server_worst, badge_info, outcome_targets
+
+
+def _outcome_targets(response: dict, ext_owner: list) -> list[dict]:
+    """The extractions eligible for outcome write-back: keyed /v1 responses
+    echo a ``change_id`` on each analyzed migration/query result (anonymous
+    responses carry none, and errored / rate-limited / explain results have
+    no verdict to report a disposition for)."""
+    targets = []
+    for res in response.get("results") or []:
+        cid = res.get("change_id")
+        if not (isinstance(cid, str) and cid) or res.get("error") or res.get("rate_limited"):
+            continue
+        if res.get("kind") not in ("migration", "query"):
+            continue
+        idx = res.get("index")
+        path = ext_owner[idx] if isinstance(idx, int) and 0 <= idx < len(ext_owner) else res.get("source_file")
+        sev = res.get("overall_severity")
+        targets.append({"id": cid, "file": path, "severity": sev if sev in SEVERITY_RANK else None})
+    return targets
 
 
 def _batch_failed(reports: dict, ext_owner: list, opts: argparse.Namespace, msg: str, exc: Exception) -> None:
@@ -2322,6 +2373,130 @@ def upsert_github_comment(markdown: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Outcome write-back (POST /v1/outcome) — the review-record disposition loop
+# --------------------------------------------------------------------------
+
+def plan_outcomes(targets: list[dict], prev_failed: list[dict], gate_rank: Optional[int],
+                  run_failed: bool) -> tuple[list[dict], list[dict]]:
+    """Decide what to report to POST /v1/outcome and what to remember for the
+    next run of this PR. Pure: all I/O stays with the callers.
+
+    Per-change gate disposition: a change fails the gate when the run failed
+    AND its own severity meets the gate — the same per-verdict definition the
+    server could re-derive, so an innocuous change riding in a failing run is
+    not smeared as gate_failed. acted_upon: a change that failed on a previous
+    run whose change_id is gone (the file was edited, so its content hash
+    changed) while every current extraction of that file clears the gate —
+    the finding is gone because the author acted on it. A file that still
+    fails after an edit reports the new id as gate_failed instead; the old
+    id keeps its recorded gate_failed disposition server-side.
+
+    Returns ``(events, new_failed_state)`` where events are
+    ``{change_id, kind, severity}`` bodies and new_failed_state is the
+    ``{id, file, severity}`` list to embed in the upserted comment
+    (currently-failing changes, plus prior failures whose file was not
+    re-analyzed this run — a later run may still resolve them)."""
+    current_ids = {t["id"] for t in targets}
+    analyzed_files = {t["file"] for t in targets}
+    failing = [t for t in targets
+               if run_failed and gate_rank is not None
+               and SEVERITY_RANK.get(t.get("severity") or "", -1) >= gate_rank]
+    failing_ids = {t["id"] for t in failing}
+    failing_files = {t["file"] for t in failing}
+
+    events = [{"change_id": t["id"], "kind": "gate_failed" if t["id"] in failing_ids else "gate_passed",
+               "severity": t.get("severity")} for t in targets]
+    carried: list[dict] = []
+    for e in prev_failed:
+        cid, path = e.get("id"), e.get("file")
+        if not cid or cid in current_ids:
+            continue  # unchanged content re-reports its own gate event above
+        if path in analyzed_files:
+            if path not in failing_files:
+                events.append({"change_id": cid, "kind": "acted_upon", "severity": e.get("severity")})
+        else:
+            carried.append(e)
+
+    new_failed = [{"id": t["id"], "file": t["file"], "severity": t.get("severity")} for t in failing]
+    return events, (new_failed + carried)[:STATE_MAX_ENTRIES]
+
+
+def embed_gate_state(markdown: str, failed: list[dict]) -> str:
+    """Embed the failing change ids in the report as an invisible HTML comment,
+    directly under the upsert marker so it survives the comment-body size
+    truncation. Always embedded when write-back is active — an empty list must
+    overwrite a previous run's stale state."""
+    state = STATE_MARKER + json.dumps({"v": 1, "failed": failed}, separators=(",", ":")) + " -->"
+    return markdown.replace(NOTE_MARKER + "\n", NOTE_MARKER + "\n" + state + "\n", 1)
+
+
+def parse_gate_state(body: Optional[str]) -> list[dict]:
+    """The previous run's failing change ids from an upserted comment body
+    (tolerant: any malformed or missing state reads as empty)."""
+    if not body or STATE_MARKER not in body:
+        return []
+    try:
+        raw = body.split(STATE_MARKER, 1)[1].split("-->", 1)[0]
+        failed = json.loads(raw).get("failed")
+        return [e for e in failed if isinstance(e, dict)] if isinstance(failed, list) else []
+    except ValueError:
+        return []
+
+
+def previous_report_body(platform: str) -> Optional[str]:
+    """The existing sixta comment on this PR/MR (the gate-state carrier), or
+    None when there is none or it cannot be read. Deliberately silent: this
+    feeds fire-and-forget write-back, never the review itself."""
+    try:
+        if platform == "github":
+            token = os.environ.get("GITHUB_TOKEN")
+            repo = os.environ.get("GITHUB_REPOSITORY")
+            api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+            pr = github_pr_number()
+            if not (token and repo and pr):
+                return None
+            url = f"{api}/repos/{repo}/issues/{pr}/comments?per_page=100"
+            headers = {"authorization": f"Bearer {token}", "accept": "application/vnd.github+json",
+                       "user-agent": "sixta-ci"}
+        else:
+            token = os.environ.get("SIXTA_BOT_TOKEN")
+            api = os.environ.get("CI_API_V4_URL")
+            project = os.environ.get("CI_PROJECT_ID")
+            mr_iid = os.environ.get("CI_MERGE_REQUEST_IID")
+            if not (token and api and project and mr_iid):
+                return None
+            url = f"{api}/projects/{project}/merge_requests/{mr_iid}/notes?per_page=100"
+            headers = {"PRIVATE-TOKEN": token}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for note in json.loads(resp.read().decode()):
+                if isinstance(note.get("body"), str) and note["body"].startswith(NOTE_MARKER):
+                    return note["body"]
+    except Exception:  # noqa: BLE001 — state fetch must never fail the run
+        pass
+    return None
+
+
+def report_outcomes(client: SixtaClient, events: list[dict]) -> None:
+    """Write the dispositions back to POST /v1/outcome, fire-and-forget:
+    failures are logged and never gate the pipeline. Stops at the first
+    transport failure — the remaining events would almost certainly fail the
+    same way, and a CI job must not sit in a send loop."""
+    sent = recorded = 0
+    for ev in events[:OUTCOME_MAX_EVENTS]:
+        try:
+            recorded += 1 if client.report_outcome(ev["change_id"], ev["kind"], ev.get("severity")) else 0
+            sent += 1
+        except Exception as exc:  # noqa: BLE001 — write-back must never fail the run
+            warn(f"outcome report failed ({ev['kind']}) — continuing without write-back: {exc}")
+            break
+    if sent:
+        skipped = len(events) - sent
+        info(f"reported {sent} change outcome(s) ({recorded} recorded)"
+             + (f"; {skipped} not sent" if skipped else ""))
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -2460,17 +2635,48 @@ def main(argv: Optional[list[str]] = None) -> int:
     v1_context = None
     server_worst = None
     badge_info = None
+    outcome_targets: list[dict] = []
     try:
         if opts.api == "v1":
-            reports, server_renders, v1_context, server_worst, badge_info = run_v1(files, opts, client, hints)
+            reports, server_renders, v1_context, server_worst, badge_info, outcome_targets = run_v1(files, opts, client, hints)
         else:
             reports = analyze_files(files, opts, client, hints)
     except SixtaAuthError as exc:
         return _auth_failed(opts, exc)
     append_ddl_auto_note(reports)
+
+    # Gate decision, computed up front: the outcome write-back and the state
+    # embedded in the upserted comment need it. The exit stays at the end so
+    # every report surface is written even on a failing gate.
+    gate_rank = GATE_RANK.get(opts.gate)
+    if server_worst is not None:
+        # v1 mode: the server's worst_severity is the gate input. It already
+        # encodes which findings gate (advisory rollback:* findings, and any
+        # local manual-review flags, inform but do not fail the pipeline).
+        worst = SEVERITY_RANK[server_worst]
+        worst_label = f"server worst_severity {server_worst}"
+    else:
+        worst = worst_rank(reports)
+        worst_name = next((k for k, v in SEVERITY_RANK.items() if v == worst), "Info")
+        worst_label = f"worst finding severity {worst_name}"
+    run_failed = gate_rank is not None and worst >= gate_rank
+
     # No footer on local pre-commit output — the badge is for public surfaces.
     footer = badge_footer_line(opts, badge_info) if not opts.local else None
     markdown = render_markdown(reports, opts.gate, v1_context, footer)
+
+    # Outcome write-back plan (POST /v1/outcome): keyed v1 CI runs only —
+    # anonymous responses carry no change_id and local pre-commit runs have no
+    # PR to carry state. SIXTA_OUTCOMES=0 opts out per run.
+    outcome_events: list[dict] = []
+    if outcome_targets and not opts.local and api_key and _env_flag_on("SIXTA_OUTCOMES", True):
+        try:
+            prev_failed = parse_gate_state(previous_report_body(opts.platform))
+            outcome_events, failed_state = plan_outcomes(outcome_targets, prev_failed, gate_rank, run_failed)
+            markdown = embed_gate_state(markdown, failed_state)
+        except Exception as exc:  # noqa: BLE001 — write-back must never fail the run
+            warn(f"outcome planning failed — continuing without write-back: {exc}")
+            outcome_events = []
 
     if opts.local:
         print(markdown.replace(NOTE_MARKER + "\n", ""))
@@ -2500,18 +2706,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 # GitLab has no step summary; the job log carries the offer.
                 info("README badge available for this repository:\n" + snippet)
 
-    gate_rank = GATE_RANK.get(opts.gate)
-    if server_worst is not None:
-        # v1 mode: the server's worst_severity is the gate input. It already
-        # encodes which findings gate (advisory rollback:* findings, and any
-        # local manual-review flags, inform but do not fail the pipeline).
-        worst = SEVERITY_RANK[server_worst]
-        worst_label = f"server worst_severity {server_worst}"
-    else:
-        worst = worst_rank(reports)
-        worst_name = next((k for k, v in SEVERITY_RANK.items() if v == worst), "Info")
-        worst_label = f"worst finding severity {worst_name}"
-    if gate_rank is not None and worst >= gate_rank:
+    # After the surfaces are written, report the dispositions (fire-and-forget).
+    if outcome_events:
+        report_outcomes(client, outcome_events)
+
+    if run_failed:
         info(f"gate failed: {worst_label} >= {opts.gate}")
         return 1
     info("gate passed")

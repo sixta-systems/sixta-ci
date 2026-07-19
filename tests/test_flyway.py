@@ -87,7 +87,7 @@ def test_run_v1_undo_only_changeset_sends_no_extractions(tmp_path):
         def analyze_v1(self, request):
             raise AssertionError("no extraction should be sent for an undo-only changeset")
 
-    reports, renders, context, worst, _badge = sr.run_v1([str(f)], _opts(), _NoPost(), hints={})
+    reports, renders, context, worst, _badge, _outcomes = sr.run_v1([str(f)], _opts(), _NoPost(), hints={})
     assert renders is None and context is None and worst is None
     assert reports[0].findings[0].check_name == "rollback-artifact"
 
