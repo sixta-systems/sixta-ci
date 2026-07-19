@@ -34,11 +34,11 @@ database with Connect Pro.
 2. Optional, for MR comments: create a project access token (`api` scope,
    Reporter role) and store it as `SIXTA_BOT_TOKEN`. `CI_JOB_TOKEN` cannot post notes.
 3. Add to `.gitlab-ci.yml` — as a [CI/CD component](https://gitlab.com/explore/catalog)
-   (recommended; `@0.6` auto-picks-up patch releases):
+   (recommended; `@0.7` auto-picks-up patch releases):
 
 ```yaml
 include:
-  - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.6
+  - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.7
     inputs:
       engine_version: "16"                      # match production; verdicts are version-dependent
       setup: pip install -r requirements.txt    # whatever makes manage.py runnable
@@ -340,7 +340,7 @@ Same verdicts before the push, via the [pre-commit](https://pre-commit.com) fram
 ```yaml
 repos:
   - repo: https://github.com/sixta-systems/sixta-ci
-    rev: v0.6.0
+    rev: v0.7.0
     hooks:
       - id: sixta-review
 ```
