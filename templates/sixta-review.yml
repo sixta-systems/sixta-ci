@@ -5,7 +5,7 @@
 # (gitlab.com/explore/catalog):
 #
 #   include:
-#     - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.5
+#     - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.6
 #       inputs:
 #         engine_version: "16"        # match production!
 #         setup: pip install -r requirements.txt
@@ -14,7 +14,7 @@
 # instances without the mirrored component project):
 #
 #   include:
-#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.5.0/templates/sixta-review.yml'
+#     - remote: 'https://raw.githubusercontent.com/sixta-systems/sixta-ci/v0.6.0/templates/sixta-review.yml'
 #       inputs: { engine_version: "16" }
 #
 # Required CI/CD variables (Settings -> CI/CD -> Variables, masked):
@@ -82,7 +82,7 @@ spec:
     sixta_url:
       default: "https://connect.sixta.ai/mcp"
     script_ref:
-      default: "v0.5.0"
+      default: "v0.6.0"
       description: Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag.
     postgres_image:
       default: "postgres:16"
