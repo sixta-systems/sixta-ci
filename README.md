@@ -262,6 +262,29 @@ resolved, so local runs are never attributed. Opt out per run with
 `SIXTA_NO_ATTRIBUTION=1` (or `true`/`yes`/`on`), per key on the portal's Keys
 page, or account-wide with "Pause my record" there.
 
+## Outcome write-back
+
+In keyed `v1` batch mode the kit also closes the loop on each verdict: after
+the gate decision it reports what became of every analyzed change
+(`POST /v1/outcome`, one small `{change_id, kind}` event per change, no SQL):
+
+- `gate_failed` / `gate_passed`: the change's own gate disposition from this
+  run. A harmless change riding in a failing pipeline still reports
+  `gate_passed`; only changes whose own severity meets the gate report
+  `gate_failed`.
+- `acted_upon`: on a re-run of the same PR/MR, a previously failing change
+  whose finding is now gone (the file was edited and its extractions all clear
+  the gate). The kit remembers failing change ids inside its own upserted
+  PR/MR comment (an invisible HTML marker), so this works on ephemeral CI
+  runners with no extra storage; without a comment token it still reports the
+  gate events, just not `acted_upon`.
+
+These dispositions feed the review record on connect.sixta.ai (the saves your
+gate actually banked). Reporting is advisory and fire-and-forget: it requires
+an API key, runs after the report surfaces are written, makes a single attempt
+per event, and can never change the pipeline's exit code. Opt out per run with
+`SIXTA_OUTCOMES=0` (or `false`/`no`/`off`).
+
 ## Inputs
 
 Shared across both platforms (GitLab job inputs / GitHub Action `with:`):

@@ -205,7 +205,7 @@ def test_run_v1_batches_ddl_and_dml_in_one_post(stub_v1, tmp_path):
     sql = tmp_path / "changes.sql"
     sql.write_text("CREATE INDEX i ON shop_order (status);\nUPDATE shop_order SET status='n' WHERE status = NULL;\n")
     client = sr.SixtaClient(stub_v1, api_key=None)
-    reports, renders, _context, _worst, _badge = sr.run_v1([str(sql)], _opts(), client, hints={})
+    reports, renders, _context, _worst, _badge, _outcomes = sr.run_v1([str(sql)], _opts(), client, hints={})
 
     # One POST for the whole run; DDL grouped into one migration extraction,
     # DML as its own query extraction.
@@ -358,7 +358,7 @@ def test_run_v1_migration_branch_groups_ddl_and_flags_runpython(stub_v1, monkeyp
     monkeypatch.setattr(sr, "render_migration", lambda mp, app, name: "CREATE INDEX i ON shop_order (status);")
     monkeypatch.setattr(sr, "has_runpython", lambda path: True)
     client = sr.SixtaClient(stub_v1, api_key=None)
-    reports, _, _context, _worst, _ = sr.run_v1(["shop/migrations/0002_x.py"], _opts(), client, hints={})
+    reports, _, _context, _worst, _, _ = sr.run_v1(["shop/migrations/0002_x.py"], _opts(), client, hints={})
 
     # DDL from the rendered migration + a local RunPython manual-review finding.
     checks = sorted(f.check_name for f in reports[0].findings)
@@ -371,7 +371,7 @@ def test_run_v1_rate_limited_extraction_is_skipped_not_gated(stub_v1, tmp_path):
     sql = tmp_path / "c.sql"
     sql.write_text("UPDATE shop_order SET status='n' WHERE status = NULL;")
     client = sr.SixtaClient(stub_v1, api_key=None)
-    reports, _, _context, _worst, _ = sr.run_v1([str(sql)], _opts(fail_mode="open"), client, hints={})
+    reports, _, _context, _worst, _, _ = sr.run_v1([str(sql)], _opts(fail_mode="open"), client, hints={})
     assert reports[0].findings == []  # the only extraction was rate limited
     assert any("rate limited" in s for s in reports[0].skipped)
     assert sr.worst_rank(reports) == -1  # does not gate
@@ -389,7 +389,7 @@ def test_run_v1_extraction_error_fail_closed_exits(stub_v1, tmp_path):
 
 def test_run_v1_batch_connectivity_fail_open_skips():
     client = sr.SixtaClient("http://127.0.0.1:1/mcp", api_key=None, timeout=1)
-    reports, renders, _context, _worst, _badge = sr.run_v1(["x.sql"], _opts(fail_mode="open"), client, hints={})
+    reports, renders, _context, _worst, _badge, _outcomes = sr.run_v1(["x.sql"], _opts(fail_mode="open"), client, hints={})
     # x.sql does not exist -> read fails -> no extractions -> no POST, empty batch.
     assert renders is None
 
@@ -487,7 +487,7 @@ def test_v1_sections_quote_the_analyzed_sql(stub_v1, tmp_path):
     sql = tmp_path / "q.sql"
     sql.write_text("UPDATE shop_order SET status = NULL WHERE id = 7;")
     client = sr.SixtaClient(stub_v1, api_key=None)
-    reports, _, _, _, _ = sr.run_v1([str(sql)], _opts(), client, hints={})
+    reports, _, _, _, _, _ = sr.run_v1([str(sql)], _opts(), client, hints={})
     joined = "\n".join(reports[0].sections)
     assert "```sql" in joined and "UPDATE shop_order SET status = NULL" in joined
 
@@ -496,7 +496,7 @@ def test_v1_no_context_block_invites_connection(stub_v1, tmp_path):
     sql = tmp_path / "q.sql"
     sql.write_text("SELECT 1;")
     client = sr.SixtaClient(stub_v1, api_key=None)
-    _, _, context, _, _ = sr.run_v1([str(sql)], _opts(), client, hints={})
+    _, _, context, _, _, _ = sr.run_v1([str(sql)], _opts(), client, hints={})
     assert context == {"source": "none"}
     md = sr.render_markdown([sr.FileReport(path="q.sql", sections=["r"])], "high", context)
     assert "connect.sixta.ai/portal/connections" in md
