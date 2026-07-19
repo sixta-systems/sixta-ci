@@ -340,7 +340,7 @@ Same verdicts before the push, via the [pre-commit](https://pre-commit.com) fram
 ```yaml
 repos:
   - repo: https://github.com/sixta-systems/sixta-ci
-    rev: v0.7.0
+    rev: v0.7.1
     hooks:
       - id: sixta-review
 ```
