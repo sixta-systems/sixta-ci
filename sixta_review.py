@@ -1891,9 +1891,15 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         request: dict = {"engine": opts.engine, "options": options, "extractions": extractions}
         if opts.engine_version:
             request["version"] = opts.engine_version
+        context_block: dict = {}
         rref = repo_ref()
         if rref:
-            request["context"] = {"repo_ref": rref}  # repo→connection routing (Connect Pro)
+            context_block["repo_ref"] = rref  # repo→connection routing (Connect Pro)
+        op = operator_identity()
+        if op:
+            context_block["operator"] = op  # author credit on the review record (hashed server-side)
+        if context_block:
+            request["context"] = context_block
         schema = capture_schema(opts)
         if schema:
             request["schema"] = {"format": "ddl", "content": schema}
@@ -2155,6 +2161,37 @@ def repo_ref() -> str | None:
     ref = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("CI_PROJECT_PATH")
     ref = (ref or "").strip()
     return ref[:256] or None
+
+
+def operator_identity() -> str | None:
+    """The change author's identity, sent as ``context.operator`` so the server
+    can credit this review to the author's personal review record. The server
+    stores only a salted hash of it, never the raw value (see the SIXTA data
+    handling statement). CI only, and each source is gated on its own runner
+    marker so a stray env var in a local shell can never attribute a run:
+    GITLAB_USER_EMAIL is honored only when GITLAB_CI confirms a real runner;
+    on GitHub Actions the author is the PR head's author email — HEAD^2,
+    because pull_request events check out GitHub's synthetic merge commit,
+    whose own author is not the change author — falling back to HEAD for
+    non-merge checkouts (push events). Outside CI (or with SIXTA_NO_ATTRIBUTION
+    set) nothing is resolved and the batch is unattributed; the account-level
+    and per-key pauses also disable it server-side."""
+    if _env_flag("SIXTA_NO_ATTRIBUTION"):
+        return None
+    op = ""
+    if os.environ.get("GITLAB_CI") == "true":
+        op = (os.environ.get("GITLAB_USER_EMAIL") or "").strip()
+    if not op and os.environ.get("GITHUB_ACTIONS") == "true":
+        for ref in ("HEAD^2", "HEAD"):
+            try:
+                lines = _git("log", "-1", "--pretty=%ae", ref)
+            except Exception:
+                continue
+            if lines:
+                op = lines[0]
+                break
+    op = op.strip()
+    return op[:256] or None
 
 
 def github_base_sha() -> Optional[str]:
