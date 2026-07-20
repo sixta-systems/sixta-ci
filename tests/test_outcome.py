@@ -124,7 +124,7 @@ def _t(cid, file, sev):
 
 def test_plan_outcomes_all_pass_on_passing_run():
     targets = [_t("1" * 64, "a.sql", "Medium"), _t("2" * 64, "b.sql", None)]
-    events, state = sr.plan_outcomes(targets, [], sr.GATE_RANK["high"], run_failed=False)
+    events, state, _banked = sr.plan_outcomes(targets, [], sr.GATE_RANK["high"], run_failed=False)
     assert [e["kind"] for e in events] == ["gate_passed", "gate_passed"]
     assert state == []
 
@@ -132,7 +132,7 @@ def test_plan_outcomes_all_pass_on_passing_run():
 def test_plan_outcomes_failing_run_splits_by_own_severity():
     """An innocuous change riding in a failing run is not smeared as gate_failed."""
     targets = [_t("1" * 64, "a.sql", "Critical"), _t("2" * 64, "b.sql", "Low")]
-    events, state = sr.plan_outcomes(targets, [], sr.GATE_RANK["high"], run_failed=True)
+    events, state, _banked = sr.plan_outcomes(targets, [], sr.GATE_RANK["high"], run_failed=True)
     kinds = {e["change_id"]: e["kind"] for e in events}
     assert kinds == {"1" * 64: "gate_failed", "2" * 64: "gate_passed"}
     assert state == [_t("1" * 64, "a.sql", "Critical")]
@@ -141,7 +141,7 @@ def test_plan_outcomes_failing_run_splits_by_own_severity():
 def test_plan_outcomes_acted_upon_when_file_reanalyzed_clean():
     prev = [_t(OLD_ID, "a.sql", "High")]
     targets = [_t("3" * 64, "a.sql", "Info")]
-    events, state = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=False)
+    events, state, _banked = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=False)
     assert {"change_id": OLD_ID, "kind": "acted_upon", "severity": "High"} in events
     assert state == []
 
@@ -149,7 +149,7 @@ def test_plan_outcomes_acted_upon_when_file_reanalyzed_clean():
 def test_plan_outcomes_no_acted_upon_while_file_still_fails():
     prev = [_t(OLD_ID, "a.sql", "High")]
     targets = [_t("3" * 64, "a.sql", "Critical")]
-    events, state = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=True)
+    events, state, _banked = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=True)
     assert [e["kind"] for e in events] == ["gate_failed"]  # new id fails; old id resolves later
     assert state == [_t("3" * 64, "a.sql", "Critical")]
 
@@ -157,7 +157,7 @@ def test_plan_outcomes_no_acted_upon_while_file_still_fails():
 def test_plan_outcomes_unchanged_failure_reports_gate_failed_not_acted_upon():
     prev = [_t(OLD_ID, "a.sql", "High")]
     targets = [_t(OLD_ID, "a.sql", "High")]  # same content hash: nothing changed
-    events, state = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=True)
+    events, state, _banked = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=True)
     assert [e["kind"] for e in events] == ["gate_failed"]
     assert state == [_t(OLD_ID, "a.sql", "High")]
 
@@ -165,7 +165,7 @@ def test_plan_outcomes_unchanged_failure_reports_gate_failed_not_acted_upon():
 def test_plan_outcomes_carries_prev_failures_for_unanalyzed_files():
     prev = [_t(OLD_ID, "gone.sql", "High")]
     targets = [_t("3" * 64, "a.sql", "Info")]
-    events, state = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=False)
+    events, state, _banked = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=False)
     assert [e["kind"] for e in events] == ["gate_passed"]  # no verdict on gone.sql: no event
     assert state == prev  # kept: a later run may still resolve it
 
@@ -278,3 +278,112 @@ def test_main_local_run_sends_no_outcomes(stub, tmp_path, monkeypatch, capsys):
     rc = sr.main(["--api", "v1", "--sixta-url", stub, "--gate", "high", "--local", str(sql)])
     assert rc == 1
     assert _outcome_calls() == []
+
+
+# --------------------------------------------------------------------------
+# v0.8: override label + the Banked line
+# --------------------------------------------------------------------------
+
+def test_plan_outcomes_override_reports_overridden_not_gate_failed():
+    targets = [_t("1" * 64, "a.sql", "Critical"), _t("2" * 64, "b.sql", "Low")]
+    events, state, banked = sr.plan_outcomes(targets, [], sr.GATE_RANK["high"], run_failed=True, overridden=True)
+    kinds = {e["change_id"]: e["kind"] for e in events}
+    assert kinds == {"1" * 64: "overridden", "2" * 64: "gate_passed"}
+    assert state == [_t("1" * 64, "a.sql", "Critical")]  # override still remembers the failure
+
+
+def test_plan_outcomes_banks_prev_impact_on_acted_upon():
+    prev = [{**_t(OLD_ID, "a.sql", "High"), "impact": 660_000}]
+    targets = [_t("3" * 64, "a.sql", "Info")]
+    events, state, banked = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=False)
+    assert {"change_id": OLD_ID, "kind": "acted_upon", "severity": "High"} in events
+    assert banked == [{"file": "a.sql", "impact": 660_000}]
+
+
+def test_plan_outcomes_state_carries_the_failing_impact_bound():
+    targets = [{**_t("1" * 64, "a.sql", "Critical"), "impact": 30_000}]
+    _events, state, _banked = sr.plan_outcomes(targets, [], sr.GATE_RANK["high"], run_failed=True)
+    assert state == [{**_t("1" * 64, "a.sql", "Critical"), "impact": 30_000}]
+
+
+def test_plan_outcomes_numberless_save_banks_nothing():
+    prev = [_t(OLD_ID, "a.sql", "High")]  # no impact bound on the failing run
+    targets = [_t("3" * 64, "a.sql", "Info")]
+    _events, _state, banked = sr.plan_outcomes(targets, prev, sr.GATE_RANK["high"], run_failed=False)
+    assert banked == []
+
+
+def test_banked_line_wording_and_units():
+    assert sr.banked_line([]) is None
+    assert sr.banked_line([{"file": "a.sql", "impact": 30_000}]) == \
+        "Banked: ~30 seconds of lock time this table never took."
+    assert sr.banked_line([{"file": "a.sql", "impact": 660_000}]) == \
+        "Banked: ~11 minutes of lock time this table never took."
+    assert sr.banked_line([{"file": "a.sql", "impact": 3_600_000}, {"file": "b.sql", "impact": 3_600_000}]) == \
+        "Banked: ~2 hours of lock time these tables never took."
+
+
+def _clear_label_env(monkeypatch):
+    for var in ("GITLAB_CI", "CI_MERGE_REQUEST_LABELS", "GITHUB_ACTIONS", "GITHUB_REPOSITORY",
+                "GITHUB_TOKEN", "GITHUB_EVENT_PATH", "GITHUB_REF", "GITHUB_API_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_override_requested_gitlab_labels_env(monkeypatch):
+    _clear_label_env(monkeypatch)
+    monkeypatch.setenv("GITLAB_CI", "true")
+    monkeypatch.setenv("CI_MERGE_REQUEST_LABELS", "backend, SIXTA: Override ,urgent")
+    assert sr.override_requested("gitlab") is True
+    monkeypatch.setenv("CI_MERGE_REQUEST_LABELS", "backend,urgent")
+    assert sr.override_requested("gitlab") is False
+
+
+def test_override_requested_github_live_lookup(monkeypatch):
+    # The label is added AFTER the gate went red, so the frozen event payload
+    # cannot carry it — the live issues API is the source of truth.
+    _clear_label_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/app")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_x")
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/7/merge")
+    seen = {}
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = json.dumps(body).encode()
+        def read(self):
+            return self._b
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        return _Resp([{"name": "sixta: override"}, {"name": "bug"}])
+
+    monkeypatch.setattr(sr.urllib.request, "urlopen", fake_urlopen)
+    assert sr.override_requested("github") is True
+    assert seen["url"].startswith("https://api.github.com/repos/acme/app/issues/7/labels")
+
+    def fake_urlopen_none(req, timeout=None):
+        return _Resp([{"name": "bug"}])
+
+    monkeypatch.setattr(sr.urllib.request, "urlopen", fake_urlopen_none)
+    assert sr.override_requested("github") is False
+
+
+def test_override_requested_fails_closed(monkeypatch):
+    # Outside a runner, or when the API errors: no override (honest default).
+    _clear_label_env(monkeypatch)
+    assert sr.override_requested("github") is False
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/app")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_x")
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/7/merge")
+
+    def boom(req, timeout=None):
+        raise OSError("api down")
+
+    monkeypatch.setattr(sr.urllib.request, "urlopen", boom)
+    assert sr.override_requested("github") is False
