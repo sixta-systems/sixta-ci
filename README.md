@@ -34,11 +34,11 @@ database with Connect Pro.
 2. Optional, for MR comments: create a project access token (`api` scope,
    Reporter role) and store it as `SIXTA_BOT_TOKEN`. `CI_JOB_TOKEN` cannot post notes.
 3. Add to `.gitlab-ci.yml` — as a [CI/CD component](https://gitlab.com/explore/catalog)
-   (recommended; `@0.7` auto-picks-up patch releases):
+   (recommended; `@0.8` auto-picks-up patch releases):
 
 ```yaml
 include:
-  - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.7
+  - component: gitlab.com/sixta-systems/sixta-ci/sixta-review@0.8
     inputs:
       engine_version: "16"                      # match production; verdicts are version-dependent
       setup: pip install -r requirements.txt    # whatever makes manage.py runnable
@@ -281,6 +281,17 @@ the gate decision it reports what became of every analyzed change
   PR/MR comment (an invisible HTML marker), so this works on ephemeral CI
   runners with no extra storage; without a comment token it still reports the
   gate events, just not `acted_upon`.
+- `overridden`: add the **`sixta: override`** label to the PR/MR and failing
+  changes report `overridden` instead of `gate_failed` — the honest record
+  that the team consciously accepted the risk. Reporting only: the gate's
+  exit code is unchanged (merging past a red gate stays a branch-protection
+  decision). GitHub reads the label live via the API (adding it after the
+  gate went red works on a re-run); GitLab reads `CI_MERGE_REQUEST_LABELS`.
+
+When an `acted_upon` re-run resolves a change whose failing run carried a
+defensible blocking estimate, the comment closes with one dry line, e.g.
+"Banked: ~11 minutes of lock time this table never took." No estimate, no
+line: the number is the server's lower bound, never an invention.
 
 These dispositions feed the review record on connect.sixta.ai (the saves your
 gate actually banked). Reporting is advisory and fire-and-forget: it requires
@@ -362,7 +373,7 @@ Same verdicts before the push, via the [pre-commit](https://pre-commit.com) fram
 ```yaml
 repos:
   - repo: https://github.com/sixta-systems/sixta-ci
-    rev: v0.7.1
+    rev: v0.8.0
     hooks:
       - id: sixta-review
 ```

@@ -1983,7 +1983,14 @@ def _outcome_targets(response: dict, ext_owner: list) -> list[dict]:
         idx = res.get("index")
         path = ext_owner[idx] if isinstance(idx, int) and 0 <= idx < len(ext_owner) else res.get("source_file")
         sev = res.get("overall_severity")
-        targets.append({"id": cid, "file": path, "severity": sev if sev in SEVERITY_RANK else None})
+        impact = res.get("impact_ms_low")
+        targets.append({
+            "id": cid, "file": path, "severity": sev if sev in SEVERITY_RANK else None,
+            # The server's defensible blocking lower bound (migrations, keyed):
+            # carried into the failing state so a later fix can print the
+            # "Banked:" line with the risk that was actually averted.
+            "impact": impact if isinstance(impact, int) and impact > 0 else None,
+        })
     return targets
 
 
@@ -2456,25 +2463,30 @@ def upsert_github_comment(markdown: str) -> None:
 # --------------------------------------------------------------------------
 
 def plan_outcomes(targets: list[dict], prev_failed: list[dict], gate_rank: Optional[int],
-                  run_failed: bool) -> tuple[list[dict], list[dict]]:
+                  run_failed: bool, overridden: bool = False) -> tuple[list[dict], list[dict], list[dict]]:
     """Decide what to report to POST /v1/outcome and what to remember for the
     next run of this PR. Pure: all I/O stays with the callers.
 
     Per-change gate disposition: a change fails the gate when the run failed
     AND its own severity meets the gate — the same per-verdict definition the
     server could re-derive, so an innocuous change riding in a failing run is
-    not smeared as gate_failed. acted_upon: a change that failed on a previous
-    run whose change_id is gone (the file was edited, so its content hash
-    changed) while every current extraction of that file clears the gate —
-    the finding is gone because the author acted on it. A file that still
-    fails after an edit reports the new id as gate_failed instead; the old
-    id keeps its recorded gate_failed disposition server-side.
+    not smeared as gate_failed. With ``overridden`` (the ``sixta: override``
+    PR/MR label), those same changes report ``overridden`` instead — the team
+    consciously accepted the risk; the ledger records the decision honestly.
+    acted_upon: a change that failed on a previous run whose change_id is gone
+    (the file was edited, so its content hash changed) while every current
+    extraction of that file clears the gate — the finding is gone because the
+    author acted on it. A file that still fails after an edit reports the new
+    id as gate_failed instead; the old id keeps its recorded gate_failed
+    disposition server-side.
 
-    Returns ``(events, new_failed_state)`` where events are
-    ``{change_id, kind, severity}`` bodies and new_failed_state is the
-    ``{id, file, severity}`` list to embed in the upserted comment
+    Returns ``(events, new_failed_state, banked)`` where events are
+    ``{change_id, kind, severity}`` bodies, new_failed_state is the
+    ``{id, file, severity, impact}`` list to embed in the upserted comment
     (currently-failing changes, plus prior failures whose file was not
-    re-analyzed this run — a later run may still resolve them)."""
+    re-analyzed this run — a later run may still resolve them), and banked is
+    the acted_upon entries whose failing run carried an impact bound — the
+    input to the "Banked:" comment line."""
     current_ids = {t["id"] for t in targets}
     analyzed_files = {t["file"] for t in targets}
     failing = [t for t in targets
@@ -2482,10 +2494,12 @@ def plan_outcomes(targets: list[dict], prev_failed: list[dict], gate_rank: Optio
                and SEVERITY_RANK.get(t.get("severity") or "", -1) >= gate_rank]
     failing_ids = {t["id"] for t in failing}
     failing_files = {t["file"] for t in failing}
+    fail_kind = "overridden" if overridden else "gate_failed"
 
-    events = [{"change_id": t["id"], "kind": "gate_failed" if t["id"] in failing_ids else "gate_passed",
+    events = [{"change_id": t["id"], "kind": fail_kind if t["id"] in failing_ids else "gate_passed",
                "severity": t.get("severity")} for t in targets]
     carried: list[dict] = []
+    banked: list[dict] = []
     for e in prev_failed:
         cid, path = e.get("id"), e.get("file")
         if not cid or cid in current_ids:
@@ -2493,11 +2507,90 @@ def plan_outcomes(targets: list[dict], prev_failed: list[dict], gate_rank: Optio
         if path in analyzed_files:
             if path not in failing_files:
                 events.append({"change_id": cid, "kind": "acted_upon", "severity": e.get("severity")})
+                impact = e.get("impact")
+                if isinstance(impact, int) and impact > 0:
+                    banked.append({"file": path, "impact": impact})
         else:
             carried.append(e)
 
-    new_failed = [{"id": t["id"], "file": t["file"], "severity": t.get("severity")} for t in failing]
-    return events, (new_failed + carried)[:STATE_MAX_ENTRIES]
+    new_failed = [{"id": t["id"], "file": t["file"], "severity": t.get("severity"),
+                   **({"impact": t["impact"]} if t.get("impact") else {})} for t in failing]
+    return events, (new_failed + carried)[:STATE_MAX_ENTRIES], banked
+
+
+OVERRIDE_LABEL = "sixta: override"
+
+
+def override_requested(platform: str) -> bool:
+    """Whether this PR/MR carries the ``sixta: override`` label — the team's
+    explicit record that they accept a gate-failing change. Reporting only:
+    failing changes then land on the review record as ``overridden`` instead
+    of ``gate_failed``; the exit code is unchanged (merging past a red gate
+    stays a branch-protection decision, not a label).
+
+    GitLab supplies labels directly (CI_MERGE_REQUEST_LABELS, on a real
+    runner only). GitHub needs a live lookup — the event payload's labels are
+    frozen at trigger time, and the whole point of the label is that it was
+    added AFTER the gate went red — so ask the issues API with GITHUB_TOKEN,
+    falling back to the payload when no token is available. Any failure reads
+    as no-override (fail closed to the honest disposition)."""
+    label = OVERRIDE_LABEL.casefold()
+    if os.environ.get("GITLAB_CI") == "true":
+        raw = os.environ.get("CI_MERGE_REQUEST_LABELS") or ""
+        return any(part.strip().casefold() == label for part in raw.split(","))
+    if platform != "github" or os.environ.get("GITHUB_ACTIONS") != "true":
+        return False
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    num = github_pr_number()
+    token = os.environ.get("GITHUB_TOKEN")
+    if repo and num and token:
+        api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+        req = urllib.request.Request(
+            f"{api}/repos/{repo}/issues/{num}/labels?per_page=100",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                labels = json.loads(resp.read().decode())
+            return any(isinstance(entry, dict) and str(entry.get("name", "")).casefold() == label for entry in labels)
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path and os.path.exists(event_path):
+        try:
+            with open(event_path, encoding="utf-8") as fh:
+                labels = json.load(fh).get("pull_request", {}).get("labels", [])
+            return any(isinstance(entry, dict) and str(entry.get("name", "")).casefold() == label for entry in labels)
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def _human_duration(ms: int) -> str:
+    """~ lower-bound phrasing for the Banked line: seconds under 90 s, minutes
+    under 90 min, hours beyond."""
+    seconds = ms / 1000
+    if seconds < 90:
+        n = max(1, round(seconds))
+        return f"~{n} second{'s' if n != 1 else ''}"
+    minutes = seconds / 60
+    if minutes < 90:
+        n = round(minutes)
+        return f"~{n} minute{'s' if n != 1 else ''}"
+    n = round(minutes / 60)
+    return f"~{n} hour{'s' if n != 1 else ''}"
+
+
+def banked_line(banked: list[dict]) -> Optional[str]:
+    """The one dry line at the banking moment (docs/record-plan.md): a
+    previously failing change came back clean, and the failing run had a
+    defensible blocking lower bound. Numberless saves stay silent — better no
+    line than an invented figure."""
+    total = sum(e["impact"] for e in banked)
+    if total <= 0:
+        return None
+    tables = "these tables" if len(banked) > 1 else "this table"
+    return f"Banked: {_human_duration(total)} of lock time {tables} never took."
 
 
 def embed_gate_state(markdown: str, failed: list[dict]) -> str:
@@ -2751,7 +2844,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     if outcome_targets and not opts.local and api_key and _env_flag_on("SIXTA_OUTCOMES", True):
         try:
             prev_failed = parse_gate_state(previous_report_body(opts.platform))
-            outcome_events, failed_state = plan_outcomes(outcome_targets, prev_failed, gate_rank, run_failed)
+            overridden = run_failed and override_requested(opts.platform)
+            if overridden:
+                info(f"'{OVERRIDE_LABEL}' label present — failing changes report 'overridden' (exit code unchanged)")
+            outcome_events, failed_state, banked = plan_outcomes(outcome_targets, prev_failed, gate_rank, run_failed, overridden)
+            line = banked_line(banked)
+            if line:
+                # The dry banking line sits above the badge footer when there is
+                # one, else closes the report (docs/record-plan.md).
+                if footer and footer in markdown:
+                    markdown = markdown.replace(footer, f"{line}\n\n{footer}", 1)
+                else:
+                    markdown = f"{markdown}\n\n{line}"
             markdown = embed_gate_state(markdown, failed_state)
         except Exception as exc:  # noqa: BLE001 — write-back must never fail the run
             warn(f"outcome planning failed — continuing without write-back: {exc}")
