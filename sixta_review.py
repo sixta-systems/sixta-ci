@@ -1929,6 +1929,10 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         op = operator_identity()
         if op:
             context_block["operator"] = op  # author credit on the review record (hashed server-side)
+        if getattr(opts, "platform", "gitlab") == "github":
+            oidc = github_oidc_token()
+            if oidc:
+                context_block["github"] = {"oidc_token": oidc}  # repo proof for the App-posted check
         if context_block:
             request["context"] = context_block
         schema = capture_schema(opts)
@@ -1959,6 +1963,7 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         server_worst = ws if ws in SEVERITY_RANK else None
         bd = response.get("badge")
         badge_info = bd if isinstance(bd, dict) else None
+        report_check_outcome(response.get("github"))
 
     return [reports[p] for p in order], server_renders, context, server_worst, badge_info, outcome_targets
 
@@ -2256,6 +2261,67 @@ def operator_identity() -> str | None:
                 op = ""
     op = op.strip()
     return op[:256] or None
+
+
+def github_oidc_token() -> Optional[str]:
+    """The GitHub Actions OIDC token, sent as ``context.github.oidc_token`` so
+    SIXTA Connect can post this batch's verdict as the ``SIXTA review`` check
+    run via the SIXTA Connect GitHub App (as ``sixta-connect[bot]``). The token
+    is the repo-control proof: SIXTA verifies it against GitHub's own signing
+    keys and posts only to the repository and commit GitHub signed into it —
+    which is why this is a token mint, not an env read.
+
+    Minted only on a real Actions runner AND only when the workflow grants
+    ``permissions: id-token: write`` (GitHub exposes the request URL/token env
+    pair only then). Without the grant, or outside Actions, or with
+    ``SIXTA_NO_CHECK`` set, returns None and the run is unchanged — no check,
+    everything else as before. The token is verified server-side and
+    discarded, never persisted (see the SIXTA data handling statement). The
+    check additionally requires the SIXTA Connect GitHub App installed on the
+    repository: https://github.com/apps/sixta-connect
+    """
+    if _env_flag("SIXTA_NO_CHECK"):
+        return None
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return None
+    url = (os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL") or "").strip()
+    bearer = (os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN") or "").strip()
+    if not url or not bearer:
+        return None
+    audience = os.environ.get("SIXTA_GH_OIDC_AUDIENCE") or "https://connect.sixta.ai"
+    sep = "&" if "?" in url else "?"
+    req = urllib.request.Request(
+        f"{url}{sep}audience={urllib.parse.quote(audience, safe='')}",
+        headers={"Authorization": f"Bearer {bearer}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            token = (json.loads(resp.read().decode()).get("value") or "").strip()
+    except Exception as exc:  # fail-open: the check is an add-on, never the run
+        warn(f"could not mint the GitHub OIDC token; SIXTA review check skipped ({exc})")
+        return None
+    return token or None
+
+
+def report_check_outcome(github_block: object) -> None:
+    """Surface the server's check-posting outcome in the run log. ``github`` is
+    present in the /v1 response only when the batch carried an OIDC token, so
+    silence here means the feature was not in play."""
+    if not isinstance(github_block, dict):
+        return
+    if github_block.get("check_posted"):
+        info("SIXTA review check posted by the SIXTA Connect GitHub App")
+        return
+    reason = str(github_block.get("reason") or "unknown")
+    if reason == "app_not_installed":
+        info(
+            "SIXTA review check not posted: the SIXTA Connect GitHub App is not "
+            "installed on this repository. One-click install: https://github.com/apps/sixta-connect"
+        )
+    elif reason.startswith("oidc_"):
+        warn(f"SIXTA review check not posted: the workflow's OIDC token failed verification ({reason})")
+    else:
+        info(f"SIXTA review check not posted ({reason})")
 
 
 def github_base_sha() -> Optional[str]:

@@ -240,7 +240,8 @@ def test_run_v1_passes_schema_and_hints(stub_v1, tmp_path, monkeypatch):
 def _clear_ci_env(monkeypatch):
     """Hermetic CI context: these tests assert exact context blocks, so the
     real CI env (GITHUB_ACTIONS, GITLAB_CI, GITLAB_USER_EMAIL) must not leak in."""
-    for var in ("GITHUB_REPOSITORY", "CI_PROJECT_PATH", "GITLAB_CI", "GITLAB_USER_EMAIL", "GITHUB_ACTIONS", "GITHUB_EVENT_NAME", "SIXTA_NO_ATTRIBUTION"):
+    for var in ("GITHUB_REPOSITORY", "CI_PROJECT_PATH", "GITLAB_CI", "GITLAB_USER_EMAIL", "GITHUB_ACTIONS", "GITHUB_EVENT_NAME", "SIXTA_NO_ATTRIBUTION",
+                "ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "SIXTA_NO_CHECK"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -286,6 +287,34 @@ def test_run_v1_gitlab_email_ignored_outside_gitlab_ci(stub_v1, tmp_path, monkey
     _clear_ci_env(monkeypatch)
     monkeypatch.setenv("CI_PROJECT_PATH", "org/app-1")
     monkeypatch.setenv("GITLAB_USER_EMAIL", "jane@acme.com")
+    sql = tmp_path / "c.sql"
+    sql.write_text("CREATE INDEX i ON shop_order (status);")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    sr.run_v1([str(sql)], _opts(), client, hints={})
+    assert StubV1Handler.calls[0]["request"]["context"] == {"repo_ref": "org/app-1"}
+
+
+def test_run_v1_sends_oidc_token_on_github_platform(stub_v1, tmp_path, monkeypatch):
+    # The minted Actions OIDC token rides as context.github.oidc_token — the
+    # repo-control proof for the App-posted `SIXTA review` check.
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "org/app-1")
+    monkeypatch.setattr(sr, "github_oidc_token", lambda: "oidc-tok")
+    sql = tmp_path / "c.sql"
+    sql.write_text("CREATE INDEX i ON shop_order (status);")
+    client = sr.SixtaClient(stub_v1, api_key=None)
+    sr.run_v1([str(sql)], _opts(platform="github"), client, hints={})
+    assert StubV1Handler.calls[0]["request"]["context"] == {
+        "repo_ref": "org/app-1", "github": {"oidc_token": "oidc-tok"},
+    }
+
+
+def test_run_v1_no_oidc_outside_github_platform(stub_v1, tmp_path, monkeypatch):
+    # GitLab (or a local run) never mints or sends the token, even if one were
+    # mintable — the check is a GitHub App feature.
+    _clear_ci_env(monkeypatch)
+    monkeypatch.setenv("CI_PROJECT_PATH", "org/app-1")
+    monkeypatch.setattr(sr, "github_oidc_token", lambda: "oidc-tok")
     sql = tmp_path / "c.sql"
     sql.write_text("CREATE INDEX i ON shop_order (status);")
     client = sr.SixtaClient(stub_v1, api_key=None)
