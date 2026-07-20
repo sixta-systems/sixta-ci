@@ -74,6 +74,9 @@ permissions:
   contents: read
   pull-requests: write      # PR comment
   security-events: write    # SARIF upload
+  id-token: write           # optional: lets SIXTA post the "SIXTA review" check
+                            # as sixta-connect[bot] (needs the SIXTA Connect
+                            # GitHub App installed: github.com/apps/sixta-connect)
 jobs:
   sixta:
     runs-on: ubuntu-latest
@@ -284,6 +287,25 @@ gate actually banked). Reporting is advisory and fire-and-forget: it requires
 an API key, runs after the report surfaces are written, makes a single attempt
 per event, and can never change the pipeline's exit code. Opt out per run with
 `SIXTA_OUTCOMES=0` (or `false`/`no`/`off`).
+
+## The "SIXTA review" check (GitHub App)
+
+With the [SIXTA Connect GitHub App](https://github.com/apps/sixta-connect)
+installed on the repository and `id-token: write` granted in the workflow
+(see the quick start), each batch's verdict also lands as a **`SIXTA review`
+check run posted by `sixta-connect[bot]`** on the PR's head commit: green when
+nothing reaches High, red when the batch's worst severity is High or Critical.
+Because it is a first-class check, you can require it in branch protection.
+
+How it works: the kit mints the workflow's short-lived OIDC token (GitHub's
+own signed statement of which repository and commit this run is for) and sends
+it with the batch; SIXTA verifies the signature against GitHub's keys, posts
+the check to exactly the repository and commit the token proves, and discards
+the token — it is never persisted. Without the App installed, without the
+`id-token: write` grant, or on GitLab, the run is unchanged: no check, no
+warning noise. Opt out per run with `SIXTA_NO_CHECK=1` (for example when the
+workflow needs `id-token: write` for other steps but you don't want the
+check). The PR comment is unaffected either way.
 
 ## Inputs
 

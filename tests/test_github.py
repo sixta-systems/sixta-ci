@@ -152,3 +152,81 @@ def test_upsert_github_comment_updates_existing(github_server):
 def test_upsert_github_comment_skips_without_token(monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     sr.upsert_github_comment("x")  # must not raise
+
+
+# --------------------------------------------------------------------------
+# GitHub Actions OIDC token (the SIXTA review check's repo-control proof)
+# --------------------------------------------------------------------------
+
+class _FakeTokenResponse:
+    def __init__(self, body: dict):
+        self._body = json.dumps(body).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _oidc_env(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://token.local/mint?x=1")
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-bearer")
+    monkeypatch.delenv("SIXTA_NO_CHECK", raising=False)
+    monkeypatch.delenv("SIXTA_GH_OIDC_AUDIENCE", raising=False)
+
+
+def test_github_oidc_token_mints_with_audience(monkeypatch):
+    _oidc_env(monkeypatch)
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["auth"] = req.headers.get("Authorization")
+        return _FakeTokenResponse({"value": "oidc-tok"})
+
+    monkeypatch.setattr(sr.urllib.request, "urlopen", fake_urlopen)
+    assert sr.github_oidc_token() == "oidc-tok"
+    # The request URL already has a query string; the audience appends with &.
+    assert seen["url"] == "https://token.local/mint?x=1&audience=https%3A%2F%2Fconnect.sixta.ai"
+    assert seen["auth"] == "Bearer runner-bearer"
+
+
+def test_github_oidc_token_absent_without_grant_or_runner(monkeypatch):
+    # No id-token: write grant -> GitHub does not expose the env pair.
+    _oidc_env(monkeypatch)
+    monkeypatch.delenv("ACTIONS_ID_TOKEN_REQUEST_URL", raising=False)
+    assert sr.github_oidc_token() is None
+    # Not on a real Actions runner: a stray env pair in a local shell is ignored.
+    _oidc_env(monkeypatch)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert sr.github_oidc_token() is None
+
+
+def test_github_oidc_token_opt_out_and_mint_failure(monkeypatch, capsys):
+    _oidc_env(monkeypatch)
+    monkeypatch.setenv("SIXTA_NO_CHECK", "1")
+    assert sr.github_oidc_token() is None
+    monkeypatch.delenv("SIXTA_NO_CHECK", raising=False)
+
+    def boom(req, timeout=None):
+        raise OSError("mint refused")
+
+    monkeypatch.setattr(sr.urllib.request, "urlopen", boom)
+    assert sr.github_oidc_token() is None  # fail-open: the check is an add-on
+    assert "SIXTA review check skipped" in capsys.readouterr().err
+
+
+def test_report_check_outcome_messages(capsys):
+    sr.report_check_outcome({"check_posted": True})
+    assert "check posted" in capsys.readouterr().err
+    sr.report_check_outcome({"check_posted": False, "reason": "app_not_installed"})
+    assert "github.com/apps/sixta-connect" in capsys.readouterr().err
+    sr.report_check_outcome({"check_posted": False, "reason": "oidc_expired"})
+    assert "WARNING" in capsys.readouterr().err
+    sr.report_check_outcome(None)  # absent block: feature not in play, silence
+    assert capsys.readouterr().err == ""
