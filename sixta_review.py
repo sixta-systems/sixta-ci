@@ -34,6 +34,12 @@ Wire protocol (two modes, selected by ``--api`` / ``SIXTA_API``):
   same PR shows a previously-failing change fixed), fire-and-forget so it can
   never fail the pipeline; opt out with ``SIXTA_OUTCOMES=0``.
 
+v1 runs can additionally post each PR's full finding set to the customer's own
+SIXTA backend (``POST /api/v1/intake/pr-gate``), where they surface as query
+findings in the SIXTA feed alongside what SIXTA observes in production. Off
+unless ``SIXTA_INTAKE_URL`` + ``SIXTA_INTAKE_TOKEN`` are set; fire-and-forget,
+never gates. See the intake section for the completeness rules.
+
 Stdlib only. Python >= 3.9.
 """
 
@@ -76,6 +82,12 @@ NOTE_MARKER = "<!-- sixta-review-report -->"
 STATE_MARKER = "<!-- sixta-ci:gate-state "
 STATE_MAX_ENTRIES = 50    # comment real estate; oldest failures beyond this are dropped
 OUTCOME_MAX_EVENTS = 100  # write-back cap per run (shares /v1's per-client rate bucket)
+# PR-gate findings intake (POST <backend>/api/v1/intake/pr-gate, v1 mode only):
+# the customer's own SIXTA backend, not connect. The backend refuses a run over
+# its bounds outright — a refused post files nothing and resolves nothing — so
+# the kit checks them before sending rather than learning by 400.
+INTAKE_MAX_FINDINGS = 200
+INTAKE_MAX_BODY_BYTES = 1_000_000
 
 SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}
 GATE_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": None}
@@ -1857,13 +1869,17 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
     context came from (Connect Pro), server_worst is the response's
     ``worst_severity`` (or None), and outcome_targets are the per-extraction
     ``change_id`` records eligible for POST /v1/outcome write-back (keyed
-    responses only; empty otherwise). The server's worst_severity is the
-    authoritative gate input: it deliberately excludes advisory findings (the
-    ``rollback:*`` family informs but does not gate)."""
+    responses only; empty otherwise), and intake_run is the finding set for
+    the backend PR-gate intake (an empty list is a clean run, which still
+    posts; None means the run was incomplete and must not post — see the
+    intake section). The server's worst_severity is the authoritative gate
+    input: it deliberately excludes advisory findings (the ``rollback:*``
+    family informs but does not gate)."""
     reports: dict[str, FileReport] = {}
     order: list[str] = []
     extractions: list[dict] = []
     ext_owner: list[str] = []  # extraction index -> owning file path
+    extraction_failed = False  # a file whose SQL could not be rendered: the run is incomplete
 
     def rep_for(path: str) -> FileReport:
         if path not in reports:
@@ -1877,6 +1893,7 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         except RuntimeError as exc:
             rep_for(path).skipped.append(str(exc))
             warn(str(exc))
+            extraction_failed = True
             continue
         if extracted is None:
             continue  # nothing extractable: no empty report section either
@@ -1946,10 +1963,10 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
             response = client.analyze_v1(request)
         except SixtaConnectivityError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA unreachable — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None, None, None, None, []
+            return [reports[p] for p in order], None, None, None, None, [], None
         except SixtaToolError as exc:
             _batch_failed(reports, ext_owner, opts, f"SIXTA error — batch analysis skipped (fail-open). {exc}", exc)
-            return [reports[p] for p in order], None, None, None, None, []
+            return [reports[p] for p in order], None, None, None, None, [], None
 
         _apply_v1_results(response, ext_owner, reports, opts, extractions)
         outcome_targets = _outcome_targets(response, ext_owner)
@@ -1965,7 +1982,13 @@ def run_v1(files: list[str], opts: argparse.Namespace, client: SixtaClient, hint
         badge_info = bd if isinstance(bd, dict) else None
         report_check_outcome(response.get("github"))
 
-    return [reports[p] for p in order], server_renders, context, server_worst, badge_info, outcome_targets
+    # The intake set: None while any file's SQL went unrendered (posting
+    # would resolve that file's findings unchecked); an empty list when the
+    # run analyzed nothing, which is a clean run and does post.
+    intake_run: Optional[list[dict]] = None
+    if not extraction_failed:
+        intake_run = intake_findings(response, extractions) if extractions else []
+    return [reports[p] for p in order], server_renders, context, server_worst, badge_info, outcome_targets, intake_run
 
 
 def _outcome_targets(response: dict, ext_owner: list) -> list[dict]:
@@ -2669,6 +2692,250 @@ def report_outcomes(client: SixtaClient, events: list[dict]) -> None:
 
 
 # --------------------------------------------------------------------------
+# SIXTA backend intake (PR-gate findings -> the customer's own feed)
+# --------------------------------------------------------------------------
+#
+# When SIXTA_INTAKE_URL + SIXTA_INTAKE_TOKEN are set, each pull-request run
+# posts its full finding set to the customer's SIXTA backend
+# (POST /api/v1/intake/pr-gate), where they become `query` findings in the
+# same feed the standing analyses file into. The backend treats the latest
+# run as authoritative for its PR: a clean run posts an empty set, which is
+# what resolves the previous push's findings. Two consequences the code
+# below enforces:
+#
+#   * An INCOMPLETE run must not post. A batch failure, a per-extraction
+#     error, or a rate-limited result means statements went unanalyzed, and
+#     posting the partial set would resolve their findings as observed-clear
+#     when nobody looked. The next complete run posts, and retries both the
+#     filings and the resolution.
+#   * A run with NOTHING to analyze must still post. A push that deletes a
+#     flagged migration produces no extractions — that empty set is exactly
+#     what clears the finding.
+#
+# The post is fire-and-forget: off unless configured, and a failure warns
+# and never gates the pipeline.
+
+
+def intake_endpoint(url: str) -> str:
+    """The intake endpoint from the configured backend URL: the base URL of
+    the SIXTA backend, or the full endpoint pasted verbatim."""
+    u = url.rstrip("/")
+    if u.endswith("/intake/pr-gate"):
+        return u
+    return u + "/api/v1/intake/pr-gate"
+
+
+def github_head_sha() -> Optional[str]:
+    """The PR head commit from the event payload; GITHUB_SHA (the merge
+    commit) as the fallback — the backend carries the sha as evidence in the
+    finding's detail, never identity, so the weaker fallback only weakens a
+    parenthetical."""
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path and os.path.exists(event_path):
+        try:
+            with open(event_path, encoding="utf-8") as fh:
+                sha = json.load(fh).get("pull_request", {}).get("head", {}).get("sha")
+            if sha:
+                return str(sha)
+        except (OSError, ValueError):
+            pass
+    return os.environ.get("GITHUB_SHA")
+
+
+def _intake_run_number(platform: str) -> Optional[int]:
+    """A monotonic run number for the backend's stale-run guard: a delayed
+    retry of an older run must not resolve a newer run's findings. GitHub:
+    run_number*1000+run_attempt, so a re-attempt outranks the attempt it
+    retries; GitLab: the pipeline iid (a job retry keeps its pipeline, and
+    the backend accepts an equal run deliberately). None when the CI does
+    not say — the backend then discloses that last arrival wins."""
+    if platform == "github":
+        try:
+            number = int(os.environ["GITHUB_RUN_NUMBER"])
+            attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT") or 1)
+            return number * 1000 + attempt
+        except (KeyError, ValueError):
+            return None
+    try:
+        return int(os.environ["CI_PIPELINE_IID"])
+    except (KeyError, ValueError):
+        return None
+
+
+def intake_context(platform: str) -> Optional[dict]:
+    """The run's identity for the intake — repo, PR number, run number, and
+    the evidence fields — from the CI environment. None when this is not a
+    pull-request run: without a PR there is no lifecycle to post into."""
+    if platform == "github":
+        repo = os.environ.get("GITHUB_REPOSITORY")
+        pr = github_pr_number()
+        if not repo or not pr:
+            return None
+        try:
+            ctx: dict = {"repo": repo, "pr": int(pr)}
+        except ValueError:
+            return None
+        server = os.environ.get("GITHUB_SERVER_URL") or "https://github.com"
+        ctx["pr_url"] = f"{server}/{repo}/pull/{pr}"
+        sha = github_head_sha()
+        if sha:
+            ctx["head_sha"] = sha
+    else:
+        repo = os.environ.get("CI_PROJECT_PATH")
+        iid = os.environ.get("CI_MERGE_REQUEST_IID")
+        if not repo or not iid:
+            return None
+        try:
+            ctx = {"repo": repo, "pr": int(iid)}
+        except ValueError:
+            return None
+        project_url = os.environ.get("CI_PROJECT_URL")
+        if project_url:
+            ctx["pr_url"] = f"{project_url}/-/merge_requests/{iid}"
+        sha = os.environ.get("CI_MERGE_REQUEST_SOURCE_BRANCH_SHA") or os.environ.get("CI_COMMIT_SHA")
+        if sha:
+            ctx["head_sha"] = sha
+    run = _intake_run_number(platform)
+    if run is not None:
+        ctx["run"] = run
+    return ctx
+
+
+def intake_findings(response: dict, extractions: list) -> Optional[list[dict]]:
+    """The wire findings for the intake, joined to the statements they judged
+    (the /v1 response's findings hang off a result whose ``index`` names the
+    extraction, and the extraction's ``sql`` is the statement the backend
+    fingerprints). None when the run is not authoritative, which requires
+    every submitted extraction to have been analyzed: a result that errored
+    or was rate-limited, an extraction the response never answers (or
+    answers twice, or answers with a result naming no submitted extraction),
+    all mean statements went unanalyzed, and a post omitting them would
+    resolve their findings without having looked. A result of a kind the kit
+    never submits (e.g. ``explain``) covers nothing, so an extraction it
+    displaces is caught by the coverage check. A finding with no rule_id is
+    skipped rather than failing the run — it carries no identity, so it
+    never filed and its omission resolves nothing."""
+    covered: set = set()
+    out: list[dict] = []
+    for res in response.get("results") or []:
+        if res.get("error") or res.get("rate_limited"):
+            return None
+        if res.get("kind") not in ("migration", "query"):
+            continue  # informational kinds cover no extraction
+        idx = res.get("index")
+        if not (isinstance(idx, int) and 0 <= idx < len(extractions)) or idx in covered:
+            return None  # a result naming no submitted extraction, or one twice
+        if res.get("kind") != extractions[idx].get("kind"):
+            # A migration result answering a submitted query extraction (or
+            # the reverse) is not the analysis that was asked for, and
+            # joining it to that extraction's SQL would publish findings
+            # under the wrong contract as authoritative.
+            return None
+        covered.add(idx)
+        sql = extractions[idx].get("sql")
+        if not sql:
+            return None
+        for f in (res.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
+            rule = str(f.get("rule_id") or "").strip()
+            if not rule:
+                continue
+            entry: dict = {"rule_id": rule, "severity": str(f.get("severity") or ""), "sql": sql}
+            for key in ("title", "operation", "table", "source_file"):
+                v = f.get(key)
+                if isinstance(v, str) and v.strip():
+                    entry[key] = v
+            line = f.get("source_line")
+            if isinstance(line, int) and line > 0:
+                entry["source_line"] = line
+            out.append(entry)
+    if len(covered) != len(extractions):
+        return None  # an unanswered extraction is unanalyzed, not clean
+    return out
+
+
+def post_intake(opts: argparse.Namespace, findings: Optional[list[dict]]) -> None:
+    """POST one run's finding set to the backend intake, fire-and-forget: a
+    failed post warns and never gates — the backend's design has the next
+    run retry both the filings and the resolution."""
+    url = getattr(opts, "intake_url", None)
+    token = (os.environ.get("SIXTA_INTAKE_TOKEN") or "").strip()
+    if not url and not token:
+        return
+    if getattr(opts, "local", False):
+        return  # a pre-commit run has no PR lifecycle to post into
+    if not url or not token:
+        warn("intake: SIXTA_INTAKE_URL and SIXTA_INTAKE_TOKEN must both be set; the PR-gate post was skipped")
+        return
+    # The intake speaks only for v1 runs — including the empty set, because
+    # in mcp mode a non-empty run never posts, so an empty post could
+    # resolve findings a later mcp run has no way to re-file.
+    if getattr(opts, "api", None) != "v1":
+        warn("the PR-gate intake reads /v1 results — set SIXTA_API=v1; the post was skipped")
+        return
+    if findings is None:
+        warn("intake: this run's analysis was incomplete, so its findings were not posted — "
+             "an incomplete run must not resolve findings it did not check; the next complete run posts them")
+        return
+    ctx = intake_context(opts.platform)
+    if ctx is None:
+        info("intake: not a pull-request run — nothing to post")
+        return
+    if len(findings) > INTAKE_MAX_FINDINGS:
+        warn(f"intake: {len(findings)} findings exceed the backend's per-run bound of {INTAKE_MAX_FINDINGS}; the post was skipped")
+        return
+    endpoint = intake_endpoint(url)
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme != "https" and (parsed.hostname or "").lower() not in ("localhost", "127.0.0.1", "::1"):
+        # Warn rather than refuse: SIXTA backends do run on plain HTTP
+        # inside private networks, and refusing would break exactly the
+        # deployments the intake serves. The token and findings still
+        # deserve the nudge.
+        warn("intake: SIXTA_INTAKE_URL is not https — the token and findings travel unencrypted; use https for any backend beyond this host")
+    body = dict(ctx)
+    engine = getattr(opts, "engine", None)
+    if engine in ("postgresql", "mysql"):
+        body["engine"] = engine
+    body["findings"] = findings
+    payload = json.dumps(body).encode()
+    if len(payload) > INTAKE_MAX_BODY_BYTES:
+        warn("intake: the run's payload exceeds the backend's 1MB bound; the post was skipped")
+        return
+    req = urllib.request.Request(
+        endpoint, data=payload, method="POST",
+        headers={"content-type": "application/json", "authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            reply = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = str(json.loads(exc.read().decode("utf-8", "replace")).get("detail") or "")
+        except Exception:  # noqa: BLE001 — an unreadable error body costs the detail, not the run
+            pass
+        if exc.code == 409:
+            # The stale-run guard working as designed: a newer run already
+            # posted, so this (retried, delayed) one has nothing to say.
+            info(f"intake: the backend refused this run as stale — a newer run already posted{': ' + detail if detail else ''}")
+        else:
+            warn(f"intake post failed (HTTP {exc.code}) — the gate is unaffected{': ' + (detail or str(exc))}")
+        return
+    except Exception as exc:  # noqa: BLE001 — the intake must never fail the run
+        warn(f"intake post failed — the gate is unaffected and the next run retries: {exc}")
+        return
+    if not isinstance(reply, dict):
+        reply = {}
+    counts = ", ".join(f"{reply.get(k, 0)} {k}" for k in ("created", "regressed", "refreshed", "resolved"))
+    info(f"intake: posted {len(findings)} finding(s) to the SIXTA backend ({counts})")
+    if reply.get("warning"):
+        warn(f"intake: {reply['warning']}")
+    if reply.get("note"):
+        info(f"intake: {reply['note']}")
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -2721,6 +2988,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="append the 'reviewed by SIXTA' footer badge to PR/MR comments (default on; "
                         "turning it off is a Connect Pro setting, confirmed via the v1 API)")
     p.add_argument("--sixta-url", default=os.environ.get("SIXTA_URL", DEFAULT_SIXTA_URL))
+    p.add_argument("--intake-url", default=os.environ.get("SIXTA_INTAKE_URL") or None,
+                   help="Base URL of your own SIXTA backend for the PR-gate findings intake "
+                        "(pairs with the SIXTA_INTAKE_TOKEN env secret; unset = off)")
     p.add_argument("--manage-py", default=os.environ.get("SIXTA_MANAGE_PY", "manage.py"))
     p.add_argument("--alembic-config", default=os.environ.get("SIXTA_ALEMBIC_CONFIG", "alembic.ini"),
                    help="Alembic config file for offline SQL rendering (alembic upgrade --sql)")
@@ -2798,6 +3068,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         info("no changed migrations or SQL files — nothing to do")
         if not opts.local:
             _write_empty_artifacts(opts)
+            # A diff with no SQL is a clean run for the backend intake: a
+            # push that deleted a flagged migration lands here, and only
+            # posting the empty set resolves that finding. post_intake's
+            # own gate keeps this v1-only, like every other post.
+            post_intake(opts, [])
         return 0
     info(f"analyzing {len(files)} file(s): {', '.join(files)}")
 
@@ -2808,9 +3083,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     server_worst = None
     badge_info = None
     outcome_targets: list[dict] = []
+    intake_run: Optional[list[dict]] = None
     try:
         if opts.api == "v1":
-            reports, server_renders, v1_context, server_worst, badge_info, outcome_targets = run_v1(files, opts, client, hints)
+            reports, server_renders, v1_context, server_worst, badge_info, outcome_targets, intake_run = run_v1(files, opts, client, hints)
         else:
             reports = analyze_files(files, opts, client, hints)
     except SixtaAuthError as exc:
@@ -2892,6 +3168,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # After the surfaces are written, report the dispositions (fire-and-forget).
     if outcome_events:
         report_outcomes(client, outcome_events)
+
+    # And the backend intake (fire-and-forget too): the run's full finding
+    # set to the customer's own SIXTA feed. v1 only — the per-finding wire
+    # fields and their statements are the /v1 response's — enforced by
+    # post_intake's own gate so no call site can forget it.
+    post_intake(opts, intake_run)
 
     if run_failed:
         info(f"gate failed: {worst_label} >= {opts.gate}")
