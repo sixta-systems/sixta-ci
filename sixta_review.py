@@ -2825,6 +2825,12 @@ def intake_findings(response: dict, extractions: list) -> Optional[list[dict]]:
         idx = res.get("index")
         if not (isinstance(idx, int) and 0 <= idx < len(extractions)) or idx in covered:
             return None  # a result naming no submitted extraction, or one twice
+        if res.get("kind") != extractions[idx].get("kind"):
+            # A migration result answering a submitted query extraction (or
+            # the reverse) is not the analysis that was asked for, and
+            # joining it to that extraction's SQL would publish findings
+            # under the wrong contract as authoritative.
+            return None
         covered.add(idx)
         sql = extractions[idx].get("sql")
         if not sql:

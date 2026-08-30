@@ -155,6 +155,15 @@ def test_intake_findings_none_on_a_duplicate_result_index():
     assert sr.intake_findings(resp, _extractions()) is None
 
 
+def test_intake_findings_none_when_a_result_answers_as_the_wrong_kind():
+    # A migration result at a submitted query extraction's index is not the
+    # analysis that was asked for; joining it to the query SQL would post
+    # findings under the wrong contract as authoritative.
+    resp = _response()
+    resp["results"][1]["kind"] = "migration"
+    assert sr.intake_findings(resp, _extractions()) is None
+
+
 def test_intake_findings_none_when_an_informational_kind_displaces_a_result():
     # The kit never submits an "explain" extraction, so an extraction
     # answered only by one was not analyzed as migration or query.
