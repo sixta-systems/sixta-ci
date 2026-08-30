@@ -20,6 +20,8 @@
 # Required CI/CD variables (Settings -> CI/CD -> Variables, masked):
 #   SIXTA_API_KEY     free key from connect.sixta.ai/portal
 #   SIXTA_BOT_TOKEN   optional: project access token (api scope, Reporter+) for MR comments
+#   SIXTA_INTAKE_TOKEN optional: with the intake_url input, posts each MR's
+#                      findings to your own SIXTA backend's feed (never gates)
 #
 # The job needs merge-request pipelines enabled — with branch-only pipelines it
 # never runs. Self-hosted runners need outbound HTTPS to connect.sixta.ai
@@ -81,6 +83,9 @@ spec:
       description: Liquibase CLI for offline changelog rendering (update-sql). Install it via `setup` when using XML/YAML/JSON changelogs; SQL-format changelogs need no CLI.
     sixta_url:
       default: "https://connect.sixta.ai/mcp"
+    intake_url:
+      default: ""
+      description: v1 only — base URL of your own SIXTA backend for the PR-gate findings intake (set the SIXTA_INTAKE_TOKEN CI/CD variable beside it; empty = off).
     script_ref:
       default: "v0.8.0"
       description: Git ref of sixta-systems/sixta-ci to fetch sixta_review.py from. Pin a tag.
@@ -123,6 +128,7 @@ sixta-review:
     SIXTA_GATE: $[[ inputs.gate ]]
     SIXTA_FAIL_MODE: $[[ inputs.fail_mode ]]
     SIXTA_URL: $[[ inputs.sixta_url ]]
+    SIXTA_INTAKE_URL: $[[ inputs.intake_url ]]
     SIXTA_MANAGE_PY: $[[ inputs.manage_py ]]
     SIXTA_LIQUIBASE_CMD: $[[ inputs.liquibase_cmd ]]
   script:

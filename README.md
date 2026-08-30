@@ -318,6 +318,34 @@ warning noise. Opt out per run with `SIXTA_NO_CHECK=1` (for example when the
 workflow needs `id-token: write` for other steps but you don't want the
 check). The PR comment is unaffected either way.
 
+## Posting findings to your own SIXTA backend
+
+Teams running the [SIXTA backend](https://github.com/fortxun/sixta-backend)
+can have each pull request's findings land in SIXTA's own feed, beside what
+SIXTA observes in production — proposed SQL and applied SQL reviewed in one
+place. Set two values (`v1` mode only):
+
+- `intake_url` (or `SIXTA_INTAKE_URL`): the base URL of your SIXTA backend,
+  e.g. `https://sixta.internal.example.com`.
+- `SIXTA_INTAKE_TOKEN` (env secret, never an input): the backend's
+  `SIXTA_INTAKE_TOKEN` value.
+
+After the gate decision, the kit posts the run's **full** finding set to
+`POST /api/v1/intake/pr-gate` — including an empty set on a clean run, which
+is what resolves the findings a previous push filed. The backend treats the
+latest run as authoritative per PR, so the kit refuses to post an incomplete
+run (a batch failure, an unrendered migration, or a rate-limited statement):
+posting a partial set would resolve findings nobody re-checked. The post is
+fire-and-forget — off unless configured, a failure warns and never gates,
+and the next complete run retries both the filings and the resolution. Runs
+are ordered by a monotonic run number (GitHub: `run_number × 1000 +
+run_attempt`; GitLab: the pipeline IID) so a delayed retry of an older run
+cannot resolve a newer run's findings.
+
+The statements travel to your own backend over the token-authed channel and
+are tokenized at its door (literals replaced) before anything is stored;
+connect is not involved in this path.
+
 ## Inputs
 
 Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
@@ -333,6 +361,7 @@ Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
 | `badge` | `true` | Append the "reviewed by SIXTA" footer badge to the PR/MR comment. Turning it off is a Connect Pro setting, confirmed via the `v1` API. See "The badge". |
 | `setup` / `manage_py` | `pip install -r requirements.txt` / `manage.py` | Reuse your test job's environment. Leave `setup` empty for `.sql`-only repos. |
 | `sixta_url` | `https://connect.sixta.ai/mcp` | SIXTA endpoint. |
+| `intake_url` | none | `v1` only: base URL of your own SIXTA backend for the PR-gate findings intake (pairs with the `SIXTA_INTAKE_TOKEN` env secret). See "Posting findings to your own SIXTA backend". |
 
 GitLab-only: `image`, `postgres_image`, `allow_failure`, `stage`, `script_ref`.
 GitHub-only: `working_directory` (monorepo subdir), `python_version`, `sarif`
