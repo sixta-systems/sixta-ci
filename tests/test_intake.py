@@ -139,6 +139,30 @@ def test_intake_findings_none_when_a_findings_statement_is_unrecoverable():
     assert sr.intake_findings(resp, _extractions()) is None
 
 
+def test_intake_findings_none_when_an_extraction_is_unanswered():
+    # A response omitting a submitted extraction is a run that did not
+    # analyze it: posting the remainder as authoritative would resolve the
+    # missing statement's findings unchecked.
+    resp = _response()
+    del resp["results"][1]
+    assert sr.intake_findings(resp, _extractions()) is None
+
+
+def test_intake_findings_none_on_a_duplicate_result_index():
+    resp = _response()
+    resp["results"][1]["index"] = 0
+    resp["results"][1]["kind"] = "migration"
+    assert sr.intake_findings(resp, _extractions()) is None
+
+
+def test_intake_findings_none_when_an_informational_kind_displaces_a_result():
+    # The kit never submits an "explain" extraction, so an extraction
+    # answered only by one was not analyzed as migration or query.
+    resp = _response()
+    resp["results"][1]["kind"] = "explain"
+    assert sr.intake_findings(resp, _extractions()) is None
+
+
 def test_intake_findings_ignores_unknown_result_kinds():
     resp = _response()
     resp["results"].append({"index": 0, "kind": "explain", "findings": [{"rule_id": "X", "severity": "Info"}]})
@@ -238,6 +262,32 @@ def test_post_intake_local_run_never_posts(stub_intake, monkeypatch, tmp_path):
     monkeypatch.setenv("SIXTA_INTAKE_TOKEN", "tok-1")
     sr.post_intake(_opts(intake_url=stub_intake, platform="github", local=True), [])
     assert StubIntakeHandler.calls == []
+
+
+def test_post_intake_mcp_mode_never_posts_even_the_empty_set(stub_intake, monkeypatch, tmp_path, capsys):
+    # In mcp mode a non-empty run never posts, so an empty post (the
+    # no-changed-files path included) could resolve findings a later mcp
+    # run has no way to re-file. The gate lives inside post_intake so no
+    # call site can forget it.
+    _github_pr_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("SIXTA_INTAKE_TOKEN", "tok-1")
+    sr.post_intake(_opts(intake_url=stub_intake, platform="github", api="mcp"), [])
+    assert StubIntakeHandler.calls == []
+    assert "SIXTA_API=v1" in capsys.readouterr().err
+
+
+def test_post_intake_plain_http_beyond_loopback_warns(monkeypatch, tmp_path, capsys):
+    _github_pr_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("SIXTA_INTAKE_TOKEN", "tok-1")
+    sr.post_intake(_opts(intake_url="http://sixta.invalid:8100", platform="github"), [])
+    assert "unencrypted" in capsys.readouterr().err
+
+
+def test_post_intake_loopback_http_is_not_warned_about(stub_intake, monkeypatch, tmp_path, capsys):
+    _github_pr_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("SIXTA_INTAKE_TOKEN", "tok-1")
+    sr.post_intake(_opts(intake_url=stub_intake, platform="github"), [])
+    assert "unencrypted" not in capsys.readouterr().err
 
 
 def test_post_intake_outside_a_pr_posts_nothing(stub_intake, monkeypatch):

@@ -2805,26 +2805,33 @@ def intake_findings(response: dict, extractions: list) -> Optional[list[dict]]:
     """The wire findings for the intake, joined to the statements they judged
     (the /v1 response's findings hang off a result whose ``index`` names the
     extraction, and the extraction's ``sql`` is the statement the backend
-    fingerprints). None when the run is not authoritative: a result that
-    errored or was rate-limited means its statements went unanalyzed, and a
-    post omitting them would resolve their findings without having looked. A
-    finding with no rule_id is skipped rather than failing the run — it
-    carries no identity, so it never filed and its omission resolves
-    nothing."""
+    fingerprints). None when the run is not authoritative, which requires
+    every submitted extraction to have been analyzed: a result that errored
+    or was rate-limited, an extraction the response never answers (or
+    answers twice, or answers with a result naming no submitted extraction),
+    all mean statements went unanalyzed, and a post omitting them would
+    resolve their findings without having looked. A result of a kind the kit
+    never submits (e.g. ``explain``) covers nothing, so an extraction it
+    displaces is caught by the coverage check. A finding with no rule_id is
+    skipped rather than failing the run — it carries no identity, so it
+    never filed and its omission resolves nothing."""
+    covered: set = set()
     out: list[dict] = []
     for res in response.get("results") or []:
         if res.get("error") or res.get("rate_limited"):
             return None
         if res.get("kind") not in ("migration", "query"):
-            continue
+            continue  # informational kinds cover no extraction
         idx = res.get("index")
-        sql = None
-        if isinstance(idx, int) and 0 <= idx < len(extractions):
-            sql = extractions[idx].get("sql")
-        findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
-        if findings and not sql:
-            return None  # findings whose statement is unrecoverable: incomplete
-        for f in findings:
+        if not (isinstance(idx, int) and 0 <= idx < len(extractions)) or idx in covered:
+            return None  # a result naming no submitted extraction, or one twice
+        covered.add(idx)
+        sql = extractions[idx].get("sql")
+        if not sql:
+            return None
+        for f in (res.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
             rule = str(f.get("rule_id") or "").strip()
             if not rule:
                 continue
@@ -2837,6 +2844,8 @@ def intake_findings(response: dict, extractions: list) -> Optional[list[dict]]:
             if isinstance(line, int) and line > 0:
                 entry["source_line"] = line
             out.append(entry)
+    if len(covered) != len(extractions):
+        return None  # an unanswered extraction is unanalyzed, not clean
     return out
 
 
@@ -2853,6 +2862,12 @@ def post_intake(opts: argparse.Namespace, findings: Optional[list[dict]]) -> Non
     if not url or not token:
         warn("intake: SIXTA_INTAKE_URL and SIXTA_INTAKE_TOKEN must both be set; the PR-gate post was skipped")
         return
+    # The intake speaks only for v1 runs — including the empty set, because
+    # in mcp mode a non-empty run never posts, so an empty post could
+    # resolve findings a later mcp run has no way to re-file.
+    if getattr(opts, "api", None) != "v1":
+        warn("the PR-gate intake reads /v1 results — set SIXTA_API=v1; the post was skipped")
+        return
     if findings is None:
         warn("intake: this run's analysis was incomplete, so its findings were not posted — "
              "an incomplete run must not resolve findings it did not check; the next complete run posts them")
@@ -2864,6 +2879,14 @@ def post_intake(opts: argparse.Namespace, findings: Optional[list[dict]]) -> Non
     if len(findings) > INTAKE_MAX_FINDINGS:
         warn(f"intake: {len(findings)} findings exceed the backend's per-run bound of {INTAKE_MAX_FINDINGS}; the post was skipped")
         return
+    endpoint = intake_endpoint(url)
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme != "https" and (parsed.hostname or "").lower() not in ("localhost", "127.0.0.1", "::1"):
+        # Warn rather than refuse: SIXTA backends do run on plain HTTP
+        # inside private networks, and refusing would break exactly the
+        # deployments the intake serves. The token and findings still
+        # deserve the nudge.
+        warn("intake: SIXTA_INTAKE_URL is not https — the token and findings travel unencrypted; use https for any backend beyond this host")
     body = dict(ctx)
     engine = getattr(opts, "engine", None)
     if engine in ("postgresql", "mysql"):
@@ -2874,7 +2897,7 @@ def post_intake(opts: argparse.Namespace, findings: Optional[list[dict]]) -> Non
         warn("intake: the run's payload exceeds the backend's 1MB bound; the post was skipped")
         return
     req = urllib.request.Request(
-        intake_endpoint(url), data=payload, method="POST",
+        endpoint, data=payload, method="POST",
         headers={"content-type": "application/json", "authorization": f"Bearer {token}"},
     )
     try:
@@ -3041,7 +3064,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             _write_empty_artifacts(opts)
             # A diff with no SQL is a clean run for the backend intake: a
             # push that deleted a flagged migration lands here, and only
-            # posting the empty set resolves that finding.
+            # posting the empty set resolves that finding. post_intake's
+            # own gate keeps this v1-only, like every other post.
             post_intake(opts, [])
         return 0
     info(f"analyzing {len(files)} file(s): {', '.join(files)}")
@@ -3141,11 +3165,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # And the backend intake (fire-and-forget too): the run's full finding
     # set to the customer's own SIXTA feed. v1 only — the per-finding wire
-    # fields and their statements are the /v1 response's.
-    if opts.api == "v1":
-        post_intake(opts, intake_run)
-    elif opts.intake_url or os.environ.get("SIXTA_INTAKE_TOKEN"):
-        warn("the PR-gate intake reads /v1 results — set SIXTA_API=v1; the post was skipped")
+    # fields and their statements are the /v1 response's — enforced by
+    # post_intake's own gate so no call site can forget it.
+    post_intake(opts, intake_run)
 
     if run_failed:
         info(f"gate failed: {worst_label} >= {opts.gate}")

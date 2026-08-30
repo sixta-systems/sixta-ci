@@ -344,7 +344,10 @@ cannot resolve a newer run's findings.
 
 The statements travel to your own backend over the token-authed channel and
 are tokenized at its door (literals replaced) before anything is stored;
-connect is not involved in this path.
+connect is not involved in this path. Use an `https` URL: the kit warns (but
+does not refuse — SIXTA backends do run on plain HTTP inside private
+networks) when the token and findings would travel unencrypted beyond
+loopback.
 
 ## Inputs
 
