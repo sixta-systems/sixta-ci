@@ -11,6 +11,9 @@ branding:
 # Optional env:
 #   SIXTA_INTAKE_TOKEN  with the intake_url input: posts each PR's findings to your own SIXTA backend's feed (fire-and-forget, never gates)
 #
+# This action reviews a pull request. To tell SIXTA when a migration ran (the
+# deploy side), see `sixta_review.py register` and recipes/ in the README.
+#
 # The calling job must checkout with fetch-depth: 0 (the review diffs against the
 # PR base), and grant `pull-requests: write` + `security-events: write` (SARIF).
 

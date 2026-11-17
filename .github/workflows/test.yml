@@ -17,3 +17,33 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: pytest -q
+
+  # The recipes under recipes/, each run with its real tool against a local
+  # stand-in for the backend's register route (tests/test_recipes.py). A tool
+  # named in SIXTA_RECIPES_REQUIRE that is missing fails the job, so it
+  # cannot pass by skipping. Liquibase is not installed here: its test runs
+  # wherever the CLI is on PATH.
+  recipes:
+    runs-on: ubuntu-latest
+    env:
+      FLYWAY_VERSION: "11.8.2"
+      FLYWAY_SHA256: "b01677117b6be97e669314cc502da85bdce20b426bafc291738368ab980c8ca5"
+      SIXTA_RECIPES_REQUIRE: "django,alembic,sqlite3,flyway,javac"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: pip install -e ".[dev,recipes]"
+      - name: Install the Flyway command line (pinned by checksum)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/flyway.tar.gz" \
+            "https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FLYWAY_VERSION}/flyway-commandline-${FLYWAY_VERSION}.tar.gz"
+          echo "${FLYWAY_SHA256}  $RUNNER_TEMP/flyway.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/flyway.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/flyway-${FLYWAY_VERSION}" >> "$GITHUB_PATH"
+      - run: pytest -q -rs tests/test_recipes.py
