@@ -6,7 +6,9 @@ on:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, where setup-python has no Python
+    # 3.9, and the kit still supports 3.9 (pyproject requires-python).
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.9", "3.12", "3.13"]
