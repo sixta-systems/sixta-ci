@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -61,8 +62,8 @@ def env(backend):
     return e
 
 
-def _run(cmd, cwd, env, expect=0):
-    proc = subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=300)
+def _run(cmd, cwd, env, expect=0, timeout=300):
+    proc = subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout)
     assert proc.returncode == expect, f"{cmd} exited {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
     assert REGISTER_TOKEN not in proc.stdout + proc.stderr
     return proc
@@ -138,7 +139,8 @@ def _django_project(tmp_path, receiver_in_ready):
     (shop / "management" / "commands").mkdir(parents=True)
     for pkg in (shop, shop / "migrations", shop / "management", shop / "management" / "commands"):
         (pkg / "__init__.py").write_text("")
-    ready = "    def ready(self):\n        from . import sixta_register  # noqa: F401\n" if receiver_in_ready else ""
+    ready = ("    def ready(self):\n        from . import sixta_register\n\n        sixta_register.connect()\n"
+             if receiver_in_ready else "")
     (shop / "apps.py").write_text(
         "from django.apps import AppConfig\n\n\nclass ShopConfig(AppConfig):\n    name = \"shop\"\n" + ready)
     (shop / "models.py").write_text(textwrap.dedent('''
@@ -190,6 +192,38 @@ def test_django_plain_migrate_registers_nothing_without_the_receiver(tmp_path, e
     _django_project(tmp_path, receiver_in_ready=False)
     _run([sys.executable, "manage.py", "migrate"], tmp_path, env)
     assert StubRegisterHandler.calls == []
+
+
+DJANGO_SHARED_PROCESS = '''
+import os
+import django
+os.environ["DJANGO_SETTINGS_MODULE"] = "settings"
+django.setup()
+from django.core.management import call_command
+call_command("sixta_migrate")            # the wrapper: registered
+call_command("migrate", "shop", "zero")  # a plain migrate later in the same process
+'''
+
+
+def test_django_wrapper_disconnects_when_its_run_ends(tmp_path, env):
+    # One long-lived process (a test runner, a worker): the wrapper's
+    # receivers must not outlive its own run and register a later migrate.
+    _need_module("django")
+    _django_project(tmp_path, receiver_in_ready=False)
+    (tmp_path / "shared.py").write_text(DJANGO_SHARED_PROCESS)
+    before = _now()
+    _run([sys.executable, "shared.py"], tmp_path, env)
+    _check_django(_the_one_change(before, _now(), "django"))
+
+
+def test_django_wrapper_leaves_a_permanent_receiver_connected(tmp_path, env):
+    # Where ready() connected the receivers, the wrapper leaves them as it found them.
+    _need_module("django")
+    _django_project(tmp_path, receiver_in_ready=True)
+    (tmp_path / "shared.py").write_text(DJANGO_SHARED_PROCESS)
+    _run([sys.executable, "shared.py"], tmp_path, env)
+    assert len(StubRegisterHandler.calls) == 2  # the wrapper's run, then the plain migrate back to zero
+    assert "DROP TABLE" in "\n".join(StubRegisterHandler.calls[1]["body"]["statements"])
 
 
 def test_django_migrate_succeeds_when_the_backend_is_unreachable(tmp_path, env):
@@ -408,7 +442,8 @@ def _flyway_core_jar():
     return jars[0]
 
 
-def test_flyway_java_callback_registers_each_migration(tmp_path, env):
+def _flyway_callback(tmp_path, env):
+    """The recipe compiled into a jar, as its header says, and the arguments that load it."""
     _need_cli("flyway")
     _need_cli("javac")
     _need_cli("jar")
@@ -418,23 +453,67 @@ def test_flyway_java_callback_registers_each_migration(tmp_path, env):
     _run(["javac", "-cp", _flyway_core_jar(), "-d", str(classes),
           os.path.join(RECIPES, "flyway", "SixtaRegisterCallback.java")], tmp_path, env)
     _run(["jar", "cf", str(jars / "sixta-register-callback.jar"), "-C", str(classes), "."], tmp_path, env)
+    return [f"-jarDirs={jars}", "-callbacks=db.callback.SixtaRegisterCallback"]
+
+
+def test_flyway_java_callback_registers_each_migration(tmp_path, env):
+    callback = _flyway_callback(tmp_path, env)
     before = _now()
-    _run(["flyway", *_flyway_project(tmp_path), f"-jarDirs={jars}",
-          "-callbacks=db.callback.SixtaRegisterCallback", "migrate"], tmp_path, env)
+    _run(["flyway", *_flyway_project(tmp_path), *callback, "migrate"], tmp_path, env)
     _check_flyway(before, _now())
 
 
 def test_flyway_java_callback_leaves_the_migration_alone_when_the_backend_is_unreachable(tmp_path, env):
-    _need_cli("flyway")
-    _need_cli("javac")
-    _need_cli("jar")
-    classes, jars = tmp_path / "classes", tmp_path / "jars"
-    classes.mkdir()
-    jars.mkdir()
-    _run(["javac", "-cp", _flyway_core_jar(), "-d", str(classes),
-          os.path.join(RECIPES, "flyway", "SixtaRegisterCallback.java")], tmp_path, env)
-    _run(["jar", "cf", str(jars / "sixta-register-callback.jar"), "-C", str(classes), "."], tmp_path, env)
+    callback = _flyway_callback(tmp_path, env)
     env["SIXTA_CHANGE_URL"] = "http://127.0.0.1:9"
-    proc = _run(["flyway", *_flyway_project(tmp_path), f"-jarDirs={jars}",
-                 "-callbacks=db.callback.SixtaRegisterCallback", "migrate"], tmp_path, env)  # exit 0
+    proc = _run(["flyway", *_flyway_project(tmp_path), *callback, "migrate"], tmp_path, env)  # exit 0
     assert "not registered" in proc.stdout + proc.stderr
+
+
+# A placeholder's value comes from Flyway's command line, environment or
+# configuration. Here it is on the command line, which no file records.
+
+def _flyway_placeholder_project(tmp_path):
+    args = _flyway_project(tmp_path)
+    (tmp_path / "sql" / "V3__tenant_notes.sql").write_text(
+        "CREATE TABLE ${tenant_schema}.order_notes (id INTEGER PRIMARY KEY, note TEXT);\n")
+    return [*args, "-placeholders.tenant_schema=main"]
+
+
+def test_flyway_cli_wrapper_never_guesses_a_placeholders_value(tmp_path, env):
+    # The wrapper reads the migration's file, which does not say what Flyway
+    # put in ${tenant_schema}: that migration is registered by its identity.
+    _need_cli("flyway")
+    _run(["sh", os.path.join(RECIPES, "flyway", "flyway-migrate.sh"), *_flyway_placeholder_project(tmp_path)], tmp_path, env)
+    bodies = [c["body"] for c in StubRegisterHandler.calls]
+    assert [b["subject"] for b in bodies] == ["V1__create_orders.sql", "V2__add_status_index.sql", "V3__tenant_notes.sql"]
+    assert "statements" in bodies[0] and "statements" not in bodies[2]
+    assert bodies[2]["revision"] == "3"
+    assert "tenant_schema" not in str(bodies) and "order_notes" not in str(bodies)
+
+
+def test_flyway_java_callback_registers_the_text_flyway_resolved(tmp_path, env):
+    # The callback is handed the statement Flyway executed, placeholder replaced.
+    callback = _flyway_callback(tmp_path, env)
+    _run(["flyway", *_flyway_placeholder_project(tmp_path), *callback, "migrate"], tmp_path, env)
+    bodies = [c["body"] for c in StubRegisterHandler.calls]
+    assert len(bodies) == 3 and bodies[2]["subject"] == "V3__tenant_notes.sql"
+    joined = "\n".join(bodies[2]["statements"])
+    assert "CREATE TABLE main.order_notes" in joined and "tenant_schema" not in joined
+
+
+def test_flyway_java_callback_stops_a_command_that_never_reads_its_input(tmp_path, env):
+    # A register command that stalls before reading stdin: more SQL than a
+    # pipe holds must not block Flyway past the budget.
+    callback = _flyway_callback(tmp_path, env)
+    args = _flyway_project(tmp_path)
+    rows = "\n".join(f"INSERT INTO orders (id, status) VALUES ({i}, '{'x' * 1000}');" for i in range(10, 410))
+    (tmp_path / "sql" / "V3__load.sql").write_text(rows + "\n")  # about 400 KiB of statements
+    (tmp_path / "stall.py").write_text("import time\ntime.sleep(600)\n")
+    env["SIXTA_REGISTER"] = f"{sys.executable} {tmp_path / 'stall.py'}"
+    env["SIXTA_REGISTER_BUDGET"] = "3"
+    started = time.monotonic()
+    proc = _run(["flyway", *args, *callback, "migrate"], tmp_path, env, timeout=120)  # exit 0: the migration stands
+    assert time.monotonic() - started < 90
+    assert "did not finish in time" in proc.stdout + proc.stderr
+    assert StubRegisterHandler.calls == []

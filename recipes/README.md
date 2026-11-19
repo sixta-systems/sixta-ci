@@ -7,7 +7,7 @@ header says where it goes.
 | You run migrations with | Copy | It registers |
 |---|---|---|
 | Flyway inside a JVM service (Spring Boot) | [`flyway/SixtaRegisterCallback.java`](flyway/SixtaRegisterCallback.java) | one change per migration, from `afterEachMigrate`, posted at `afterMigrate` |
-| The Flyway command line | [`flyway/flyway-migrate.sh`](flyway/flyway-migrate.sh) | one change per migration the run applied |
+| The Flyway command line | [`flyway/flyway-migrate.sh`](flyway/flyway-migrate.sh) | one change per migration the run applied (by name and version only where the script has a `${placeholder}`) |
 | Alembic | [`alembic/env_hook.py`](alembic/env_hook.py) | one change per `alembic upgrade` that moved the revision |
 | Django | [`django/sixta_register.py`](django/sixta_register.py), and [`django/sixta_migrate.py`](django/sixta_migrate.py) for the command wrapper | one change per `migrate` run that applied something |
 | Liquibase | [`liquibase/liquibase-update.sh`](liquibase/liquibase-update.sh) | one change per `liquibase update` that applied something |

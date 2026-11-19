@@ -402,9 +402,12 @@ And what the change is:
 `register` always exits zero and prints one line. An unreachable backend, a
 timeout, a 4xx or 5xx, a redirect, a bad flag, an unreadable file: each is one
 `WARNING` line saying the change was not registered, and the migration that
-ran is unaffected. It makes one attempt and does not retry. The line never
-carries the token, credentials or query strings from the URL, or statement
-text. The backend's answers, for reference: `201` recorded, `200` already
+ran is unaffected. It makes one attempt and does not retry. The line is built
+from fixed sentences and the names of the command's own flags and the route's
+own fields: it never carries the token, credentials or query strings from the
+URL, statement text, the value of an argument, or any text from the backend's
+reply (so a proxy that echoes the request back cannot put your SQL in a CI
+log). The backend's answers, for reference: `201` recorded, `200` already
 recorded under that key, `400` naming the field it refused, `401` wrong
 token, `404` `SIXTA_CHANGE_TOKENS` is not set on the backend, `409` the
 database is hidden in SIXTA, `503` the backend has not read its estate yet.
@@ -420,9 +423,9 @@ header says where it goes.
 | You run migrations with | Recipe | It registers |
 |---|---|---|
 | Flyway inside a JVM service (Spring Boot) | [`recipes/flyway/SixtaRegisterCallback.java`](recipes/flyway/SixtaRegisterCallback.java) | One change per migration: `afterEachMigrate` notes it, `afterMigrate` posts it, so nothing is posted inside a migration's transaction. Needs Python 3.9+ and `sixta_review.py` in the image. |
-| The Flyway command line | [`recipes/flyway/flyway-migrate.sh`](recipes/flyway/flyway-migrate.sh) | One change per migration the run applied, from Flyway's JSON result. |
+| The Flyway command line | [`recipes/flyway/flyway-migrate.sh`](recipes/flyway/flyway-migrate.sh) | One change per migration the run applied, from Flyway's JSON result. A script with a `${placeholder}` is registered by name and version only: the wrapper reads the file and cannot see the value Flyway put there. The callback above is handed the resolved statement. |
 | Alembic | [`recipes/alembic/env_hook.py`](recipes/alembic/env_hook.py) | One change per `alembic upgrade` that moved the revision: a hook around `run_migrations` in `env.py`. |
-| Django | [`recipes/django/sixta_register.py`](recipes/django/sixta_register.py) | One change per `migrate` run that applied something: a `post_migrate` receiver. [`sixta_migrate.py`](recipes/django/sixta_migrate.py) is the management-command wrapper for projects that prefer not to add a receiver. |
+| Django | [`recipes/django/sixta_register.py`](recipes/django/sixta_register.py) | One change per `migrate` run that applied something: a `post_migrate` receiver. [`sixta_migrate.py`](recipes/django/sixta_migrate.py) is the management-command wrapper for projects that prefer not to add a receiver: it connects the receiver for its own run and disconnects it when the run ends. |
 | Liquibase | [`recipes/liquibase/liquibase-update.sh`](recipes/liquibase/liquibase-update.sh) | One change per `liquibase update` that applied something. |
 | `psql` / `mysql` in a pipeline step | [`recipes/sql/run-sql.sh`](recipes/sql/run-sql.sh) | The SQL file the step ran, timed around the step. |
 | A coding agent | [`recipes/agent/AGENTS.md`](recipes/agent/AGENTS.md) | What the agent applied, as its next step. |
@@ -467,11 +470,15 @@ are not followed), database credentials or connection URLs, bind-parameter
 values (the Alembic hook reads statement text only), rows or query results,
 environment variables, and file paths (a file's base name is used as the
 subject, nothing more). Three kinds of statement are left out: transaction
-control (`BEGIN`, `COMMIT`), the migration tool's own bookkeeping
-(`flyway_schema_history`, `DATABASECHANGELOG`, `alembic_version`,
-`django_migrations`), and any single statement over 64 KiB. A migration of
-more than 200 statements is registered by its name and version, without
-statement text. The line the command prints says when any of these happened.
+control (`BEGIN`, `COMMIT`), a statement that changes the migration tool's
+own bookkeeping table (`flyway_schema_history`, `DATABASECHANGELOG`,
+`alembic_version`, `django_migrations`; a statement that only mentions one in
+a comment or a string is sent), and any single statement over 64 KiB. Two
+kinds of migration are registered by name and version, without statement
+text: one of more than 200 statements, and, with `--flyway-json`, one whose
+script has a Flyway `${placeholder}`, because the text that ran is not in the
+file and a guessed value would put the change on a schema it never touched.
+The line the command prints says when any of these happened.
 
 Use an `https` URL: as with the intake post, the command says so (and does
 not refuse) when the token and statements would travel unencrypted beyond

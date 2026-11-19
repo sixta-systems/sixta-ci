@@ -11,10 +11,17 @@
 # What it does: runs `flyway -outputType=json migrate`, prints Flyway's result,
 # and when the run succeeded registers one change per migration it applied:
 # the script's name, its version, the statements in its SQL file, and the
-# run's start and finish. A Java-based migration is registered by its name and
-# version, with no statement text. A run that applied nothing registers
-# nothing, and neither does a run that failed (the callback recipe registers
-# the migrations that finished before a failure; this wrapper cannot see them).
+# run's start and finish. Two kinds of migration are registered by name and
+# version with no statement text: a Java-based one, and a script with a
+# ${placeholder}, because the value Flyway put there (from its command line,
+# environment or configuration) is not in the file and this wrapper will not
+# guess it. The callback recipe is handed the statement as Flyway resolved it.
+# If you changed Flyway's placeholder prefix from ${, use the callback: this
+# wrapper cannot tell such a script from plain SQL.
+#
+# A run that applied nothing registers nothing, and neither does a run that
+# failed (the callback recipe registers the migrations that finished before a
+# failure; this wrapper cannot see them).
 # Its exit code is `flyway migrate`'s, always.
 #
 # Configuration, from the step's environment:

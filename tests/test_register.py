@@ -166,6 +166,48 @@ def test_register_only_transaction_control_is_left_out(stmt, sent):
     assert (statements == [stmt]) is sent and not_a_change == (0 if sent else 1)
 
 
+@pytest.mark.parametrize("stmt,sent", [
+    # What a statement changes decides it, never what it mentions.
+    ("UPDATE orders SET note = 'checked alembic_version'", True),
+    ("-- after the alembic_version bump\nALTER TABLE orders ADD COLUMN paid_at timestamp", True),
+    ("/* django_migrations is untouched */ CREATE INDEX i ON orders (status)", True),
+    ("ALTER TABLE orders ADD COLUMN alembic_version int", True),
+    ("CREATE TABLE alembic_version_audit (id int)", True),
+    ("INSERT INTO audit (what) SELECT version FROM flyway_schema_history", True),
+    ("CREATE INDEX flyway_schema_history ON orders (status)", True),     # an index that borrows the name
+    ("UPDATE alembic_version SET version_num = 'b2' WHERE version_num = 'a1'", False),
+    ("INSERT INTO alembic_version (version_num) VALUES ('a1')", False),
+    ('INSERT INTO "PUBLIC"."DATABASECHANGELOG" (ID) VALUES (\'1\')', False),
+    ("UPDATE public.databasechangeloglock SET LOCKED = TRUE WHERE ID = 1", False),
+    ("CREATE TABLE IF NOT EXISTS `shop`.`flyway_schema_history` (installed_rank INT)", False),
+    ("-- Liquibase\nCREATE TABLE DATABASECHANGELOG (ID VARCHAR(255) NOT NULL)", False),
+    ("CREATE INDEX flyway_schema_history_s_idx ON flyway_schema_history (success)", False),
+    ("DELETE FROM django_migrations WHERE app = 'shop'", False),
+    ("ALTER TABLE [dbo].[DATABASECHANGELOG] ADD LABELS nvarchar(255)", False),
+])
+def test_register_bookkeeping_is_read_from_the_table_a_statement_changes(stmt, sent):
+    statements, not_a_change, _ = sr._register_statements([stmt])
+    assert (statements == [stmt]) is sent and not_a_change == (0 if sent else 1)
+
+
+def test_register_a_key_with_no_room_for_the_split_suffix_stays_in_bound(backend, capsys):
+    # The route admits a 200-character key; "/1" on the end of one would be refused.
+    key = "k" * sr.REGISTER_MAX_IDENT_RUNES
+    sql = ";\n".join(f"CREATE TABLE t{i} (id int)" for i in range(21))
+    code, _, err = _run(capsys, *BASE, "--statement", sql, "--idempotency-key", key)
+    assert code == 0 and "WARNING" not in err
+    keys = [c["body"]["idempotency_key"] for c in StubRegisterHandler.calls]
+    assert len(keys) == 2 and len(set(keys)) == 2
+    assert all(len(k) <= sr.REGISTER_MAX_IDENT_RUNES for k in keys)
+    # A replay derives the same keys, so nothing is recorded twice.
+    _, _, err = _run(capsys, *BASE, "--statement", sql, "--idempotency-key", key)
+    assert [c["body"]["idempotency_key"] for c in StubRegisterHandler.calls[2:]] == keys
+    assert "2 request(s) were already recorded" in _one_line(err)
+    # A one-request registration still carries the key exactly as given.
+    _run(capsys, *BASE, "--subject", "x", "--idempotency-key", key)
+    assert StubRegisterHandler.calls[4]["body"]["idempotency_key"] == key
+
+
 def test_register_splits_a_long_migration_across_requests(backend, capsys):
     sql = ";\n".join(f"CREATE TABLE t{i} (id int)" for i in range(45))
     code, _, err = _run(capsys, *BASE, "--statement", sql, "--idempotency-key", "mig-9")
@@ -346,7 +388,11 @@ def test_register_a_refusal_logs_one_line_and_exits_zero(backend, capsys, monkey
 
 def test_register_a_400_names_the_field_the_route_refused(backend, capsys):
     _, _, err = _run(capsys, "--database", "nowhere", "--subject", "x")
-    assert "invalid_registration: database: not a database the estate holds" in _one_line(err)
+    # In the kit's own words: the route's error code and field name are read
+    # against closed lists, and the reply's text is never logged.
+    line = _one_line(err)
+    assert "HTTP 400" in line and "the backend refused a field (database)" in line
+    assert "estate" not in line
 
 
 def test_register_a_401_points_at_the_token_setting_without_showing_it(backend, capsys, monkeypatch):
@@ -370,6 +416,63 @@ def test_register_an_echoed_token_never_reaches_the_log(backend, capsys):
     assert code == 0
     assert "HTTP 502" in _one_line(err)
     assert REGISTER_TOKEN not in err and REGISTER_TOKEN not in out
+
+
+# A literal a customer's SQL might carry. It must appear in nothing the
+# command prints, whatever the backend, a proxy or the shell does.
+CANARY = "canary-7c1e-s3cret@example.com"
+CANARY_SQL = f"UPDATE customers SET email = '{CANARY}', note = 'pw {CANARY}' WHERE id = 42"
+
+
+@pytest.mark.parametrize("behavior,status", [("echo", "HTTP 502"), ("echo_known", "HTTP 400"), ("echo_ok", "SIXTA recorded")])
+def test_register_sql_a_server_echoes_back_never_reaches_the_log(backend, capsys, tmp_path, behavior, status):
+    # The route itself never quotes a statement, but whatever stands in front
+    # of it may: a reply's text is not logged, only the route's own error
+    # code and field name, read against closed lists.
+    f = tmp_path / "V9__fix_emails.sql"
+    f.write_text(CANARY_SQL + ";\n")
+    StubRegisterHandler.behavior = behavior
+    code, out, err = _run(capsys, *BASE, "--file", str(f), "--statement", CANARY_SQL, "--actor", "dba@example.com")
+    assert code == 0
+    assert len(StubRegisterHandler.received) == 1 and CANARY in StubRegisterHandler.received[0]  # it was sent
+    assert status in _one_line(err)
+    for printed in (out, err):
+        assert CANARY not in printed and "customers" not in printed and REGISTER_TOKEN not in printed
+
+
+@pytest.mark.parametrize("argv", [
+    # A statement the shell split into words: argparse would quote them back.
+    ("--database", "orders-main", "--statement", "UPDATE", "customers", "SET", f"email='{CANARY}'"),
+    ("--database", "orders-main", "--statement", CANARY_SQL, "--change-id", CANARY),
+    ("--database", "orders-main", "--statement", CANARY_SQL, "--plane", CANARY),
+    ("--database", "orders-main", "--statement", CANARY_SQL, "--timeout", CANARY),
+    ("--database", "orders-main", "--statement", CANARY_SQL, "--at", CANARY),
+    ("--database", "orders-main", "--statement", CANARY_SQL, "--idempotency-key", f"'{CANARY}'"),
+    ("--database", "orders-main", "--file", f"/no/such/{CANARY}.sql"),
+    ("--database", "orders-main", "--flyway-json", f"/no/such/{CANARY}.json"),
+    ("--database", "orders-main", "--statement", CANARY_SQL, "--plane", "instance"),
+    ("--database", f"orders {CANARY}", "--statement", CANARY_SQL),       # refused by the stand-in: HTTP 400
+    ("--database", "orders-main", "--statement", CANARY_SQL, "--actor", f"'{CANARY}'"),
+    ("--database", "orders-main", CANARY_SQL),
+])
+def test_register_no_argument_value_reaches_the_log(backend, capsys, argv):
+    code, out, err = _run(capsys, *argv)
+    assert code == 0 and out == ""
+    _one_line(err)
+    assert CANARY not in err and "customers" not in err
+
+
+def test_register_a_bad_flag_is_named_and_its_value_is_not(backend, capsys):
+    _, _, err = _run(capsys, "--database", "orders-main", "--subject", "x", "--change-id", "seven")
+    line = _one_line(err)
+    assert "--change-id was not given a value it takes" in line and "seven" not in line
+
+
+def test_register_a_database_name_not_shaped_like_one_is_not_logged(backend, capsys):
+    StubRegisterHandler.behavior = "echo_ok"
+    _, _, err = _run(capsys, "--database", f"orders {CANARY}", "--subject", "x")
+    line = _one_line(err)
+    assert "SIXTA recorded the change on the database" in line and CANARY not in line
 
 
 def test_register_credentials_in_the_url_never_reach_the_log(capsys, monkeypatch):
@@ -496,7 +599,7 @@ def _flyway_result(tmp_path, migrations):
 def test_register_flyway_json_registers_each_migration(backend, capsys, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     v2 = tmp_path / "V2__add_status_index.sql"
-    v2.write_text("CREATE INDEX idx_orders_status ON ${schema}.orders (status);\n")
+    v2.write_text("CREATE INDEX idx_orders_status ON orders (status);\n")
     v3 = tmp_path / "V3__Backfill_totals.java"  # a Java migration: no SQL file to read
     result = _flyway_result(tmp_path, [
         {"category": "Versioned", "version": "2", "description": "add status index", "type": "SQL",
@@ -509,13 +612,38 @@ def test_register_flyway_json_registers_each_migration(backend, capsys, tmp_path
     assert code == 0
     first, second = (c["body"] for c in StubRegisterHandler.calls)
     assert first["subject"] == "V2__add_status_index.sql" and first["revision"] == "2"
-    assert first["statements"] == ["CREATE INDEX idx_orders_status ON schema.orders (status)"]
+    assert first["statements"] == ["CREATE INDEX idx_orders_status ON orders (status)"]
     assert second["subject"] == "V3__Backfill_totals.java" and second["revision"] == "3"
     assert "statements" not in second
     assert first["idempotency_key"] != second["idempotency_key"]
     for body in (first, second):
         assert (body["started_at"], body["finished_at"]) == ("2026-11-17T10:00:00Z", "2026-11-17T10:00:05Z")
     assert "SIXTA recorded 2 change(s) on orders-main" in _one_line(err)
+
+
+def test_register_flyway_json_never_guesses_a_placeholders_value(backend, capsys, tmp_path, monkeypatch):
+    # Flyway ran this with -placeholders.tenant_schema=production. The file
+    # does not say so, and a Spring file in the checkout says something else:
+    # either guess would register a change on a schema it never touched.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "application.properties").write_text("spring.flyway.placeholders.tenant_schema=staging\n")
+    v4 = tmp_path / "V4__tenant_index.sql"
+    v4.write_text("CREATE INDEX idx_orders_status ON ${tenant_schema}.orders (status);\n")
+    v5 = tmp_path / "V5__plain.sql"
+    v5.write_text("CREATE INDEX idx_orders_email ON orders (email);\n")
+    result = _flyway_result(tmp_path, [
+        {"version": "4", "description": "tenant index", "type": "SQL", "filepath": str(v4)},
+        {"version": "5", "description": "plain", "type": "SQL", "filepath": str(v5)},
+    ])
+    code, _, err = _run(capsys, *BASE, "--flyway-json", result)
+    assert code == 0
+    first, second = (c["body"] for c in StubRegisterHandler.calls)
+    assert first["subject"] == "V4__tenant_index.sql" and first["revision"] == "4"
+    assert "statements" not in first  # its identity, and no text: the executed text is not known here
+    sent = json.dumps([first, second])
+    assert "tenant_schema" not in sent and "staging" not in sent
+    assert second["statements"] == ["CREATE INDEX idx_orders_email ON orders (email)"]
+    assert "1 migration(s) with Flyway placeholders registered by identity" in _one_line(err)
 
 
 def test_register_flyway_json_with_nothing_applied_sends_nothing(backend, capsys, tmp_path):

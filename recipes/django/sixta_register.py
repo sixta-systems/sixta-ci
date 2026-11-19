@@ -1,17 +1,20 @@
 """Tell SIXTA when `manage.py migrate` applied migrations (a sixta-ci recipe).
 
 Where it goes: copy this file into one of your Django apps (say
-shop/sixta_register.py) and import it from that app's AppConfig.ready():
+shop/sixta_register.py) and connect it from that app's AppConfig.ready():
 
     class ShopConfig(AppConfig):
         name = "shop"
 
         def ready(self):
-            from . import sixta_register  # noqa: F401
+            from . import sixta_register
+
+            sixta_register.connect()
 
 Prefer not to add a receiver to every process? Leave ready() alone and copy
 sixta_migrate.py (beside this file) to shop/management/commands/ instead: it
-connects these receivers only for a `manage.py sixta_migrate` run.
+connects these receivers for a `manage.py sixta_migrate` run and disconnects
+them when the run ends. Importing this file connects nothing.
 
 What it does: one registration per `migrate` run that applied something, with
 the run's start and finish and the SQL Django renders for each migration it
@@ -45,20 +48,25 @@ from django.db.migrations.loader import MigrationLoader
 from django.db.models.signals import post_migrate, pre_migrate
 
 _started = {}
+_connected = False
 
 
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _note_start(sender, using, **kwargs):
-    # pre_migrate fires once per app before anything is applied: keep the first.
-    _started.setdefault(using, _now())
+def _note_start(sender, using, plan=None, **kwargs):
+    # pre_migrate fires once per app before anything is applied: keep the
+    # first of this run. A start left behind by a run that raised belongs to
+    # another plan and is replaced.
+    noted = _started.get(using)
+    if noted is None or noted[1] is not plan:
+        _started[using] = (_now(), plan)
 
 
 def _register(sender, using, plan=None, **kwargs):
     # post_migrate fires once per app with the same plan: the first one registers.
-    started = _started.pop(using, None)
+    started, _ = _started.pop(using, (None, None))
     if started is None or not plan or not os.environ.get("SIXTA_CHANGE_URL"):
         return
     try:
@@ -85,5 +93,23 @@ def _register(sender, using, plan=None, **kwargs):
         print(f"sixta-register: not registered, and the migration is unaffected: {type(exc).__name__}", file=sys.stderr)
 
 
-pre_migrate.connect(_note_start, dispatch_uid="sixta_register_start")
-post_migrate.connect(_register, dispatch_uid="sixta_register_finish")
+def connect():
+    """Connect the receivers. Call it from AppConfig.ready() to register every
+    migrate this process runs; the sixta_migrate command calls it for its own
+    run."""
+    global _connected
+    pre_migrate.connect(_note_start, dispatch_uid="sixta_register_start")
+    post_migrate.connect(_register, dispatch_uid="sixta_register_finish")
+    _connected = True
+
+
+def disconnect():
+    global _connected
+    pre_migrate.disconnect(_note_start, dispatch_uid="sixta_register_start")
+    post_migrate.disconnect(_register, dispatch_uid="sixta_register_finish")
+    _started.clear()
+    _connected = False
+
+
+def connected():
+    return _connected

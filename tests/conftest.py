@@ -130,14 +130,16 @@ def register_verdict(body: dict):
 
 class StubRegisterHandler(BaseHTTPRequestHandler):
     calls: list = []           # every request that passed the bearer check
+    received: list = []        # every body that arrived, whatever was answered
     seen_keys: set = set()
-    behavior: str = "ok"       # ok | disabled | boom | slow | redirect | echo | html
+    behavior: str = "ok"       # ok | disabled | boom | slow | redirect | echo | echo_known | echo_ok | html
     redirect_to: str = ""
 
     def do_POST(self):
         cls = StubRegisterHandler
         raw = self.rfile.read(int(self.headers.get("content-length") or 0))
         auth = self.headers.get("authorization") or ""
+        cls.received.append(raw.decode("utf-8", "replace"))
         if self.path != "/api/v1/changes":
             return self._json(404, {"error": "not_found"})
         if cls.behavior == "disabled":
@@ -148,8 +150,19 @@ class StubRegisterHandler(BaseHTTPRequestHandler):
             self.send_header("content-length", "0")
             self.end_headers()
             return None
-        if cls.behavior == "echo":  # a misbehaving proxy quoting the request back
-            return self._json(502, {"error": "bad_gateway", "detail": "upstream refused: authorization=" + auth})
+        # A misbehaving proxy quoting the whole request back, bearer and
+        # statements included, in every part of its reply a client might log.
+        try:
+            statements = " ".join(json.loads(raw).get("statements") or [])
+        except ValueError:
+            statements = ""
+        quoted = "refused " + statements + " " + raw.decode("utf-8", "replace") + " authorization=" + auth
+        if cls.behavior == "echo":
+            return self._json(502, {"error": quoted, "field": quoted, "detail": quoted, "message": quoted})
+        if cls.behavior == "echo_known":  # the route's own error code, with the request quoted beside it
+            return self._json(400, {"error": "invalid_registration", "field": quoted, "detail": quoted})
+        if cls.behavior == "echo_ok":
+            return self._json(200, {"changes": [{"id": 1, "says": quoted}], "duplicate": False, "says": quoted})
         if auth != "Bearer " + REGISTER_TOKEN:
             return self._json(401, {"error": "unauthorized"})
         if len(raw) > 256 << 10:
@@ -188,6 +201,7 @@ class StubRegisterHandler(BaseHTTPRequestHandler):
 def run_register_stub():
     """`yield from run_register_stub()`: the stand-in's base URL."""
     StubRegisterHandler.seen_keys = set()
+    StubRegisterHandler.received = []
     StubRegisterHandler.redirect_to = ""
     for url in run_stub_server(StubRegisterHandler):
         yield url.rsplit("/mcp", 1)[0]

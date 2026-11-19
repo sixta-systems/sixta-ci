@@ -39,13 +39,15 @@ import org.flywaydb.core.api.callback.Event;
  *   SIXTA_CHANGE_TOKEN     the bearer secret, from your secret store
  *   SIXTA_CHANGE_DATABASE  the database's name in SIXTA
  *   SIXTA_REGISTER         the command, default "python3 sixta_review.py register"
+ *   SIXTA_REGISTER_BUDGET  seconds the whole post may take, default 30
  * </pre>
  *
  * <p>A failure here never fails the migration: the command exits zero whatever happens, anything
- * thrown in this class is caught and written as one line, and the whole post is given 30 seconds.
+ * thrown in this class is caught and written as one line, and the whole post is given the budget
+ * above. The budget covers handing the command its statements as well as waiting for it: a command
+ * that stalls, read or unread, is stopped when the time is up and Flyway carries on.
  */
 public class SixtaRegisterCallback implements Callback {
-    private static final long BUDGET_MILLIS = 30_000;
 
     private static final class Applied {
         String script;
@@ -102,7 +104,7 @@ public class SixtaRegisterCallback implements Callback {
                 List<Applied> pending = new ArrayList<>(applied);
                 applied.clear();
                 current = null;
-                long deadline = System.currentTimeMillis() + BUDGET_MILLIS;
+                long deadline = System.currentTimeMillis() + budgetMillis();
                 for (Applied migration : pending) {
                     long left = deadline - System.currentTimeMillis();
                     if (left <= 0) {
@@ -115,6 +117,15 @@ public class SixtaRegisterCallback implements Callback {
         } catch (Exception e) {
             System.err.println("sixta-register: not registered, and the migration is unaffected: "
                     + e.getClass().getSimpleName());
+        }
+    }
+
+    private static long budgetMillis() {
+        try {
+            long seconds = Long.parseLong(System.getenv("SIXTA_REGISTER_BUDGET").trim());
+            return Math.max(1, Math.min(seconds, 600)) * 1000;
+        } catch (RuntimeException e) {
+            return 30_000;
         }
     }
 
@@ -137,12 +148,20 @@ public class SixtaRegisterCallback implements Callback {
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.redirectOutput(ProcessBuilder.Redirect.INHERIT);
         builder.redirectError(ProcessBuilder.Redirect.INHERIT);
-        Process process = builder.start();
-        try (OutputStream stdin = process.getOutputStream()) {
-            if (hasSql) {
-                stdin.write(migration.sql.toString().getBytes(StandardCharsets.UTF_8));
+        final Process process = builder.start();
+        final byte[] sql = hasSql ? migration.sql.toString().getBytes(StandardCharsets.UTF_8) : new byte[0];
+        // The statements are written from a thread of their own: a write to a command that is not
+        // reading blocks once the pipe is full, and no deadline reaches a blocked write. Stopping
+        // the command closes the pipe, which ends the write.
+        Thread writer = new Thread(() -> {
+            try (OutputStream stdin = process.getOutputStream()) {
+                stdin.write(sql);
+            } catch (Exception e) {
+                // The command went away, or was stopped for running out of time.
             }
-        }
+        }, "sixta-register-stdin");
+        writer.setDaemon(true);
+        writer.start();
         if (!process.waitFor(millis, TimeUnit.MILLISECONDS)) {
             process.destroyForcibly();
             System.err.println("sixta-register: the register command did not finish in time and was stopped");
