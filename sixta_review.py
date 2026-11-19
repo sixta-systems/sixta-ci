@@ -40,6 +40,13 @@ findings in the SIXTA feed alongside what SIXTA observes in production. Off
 unless ``SIXTA_INTAKE_URL`` + ``SIXTA_INTAKE_TOKEN`` are set; fire-and-forget,
 never gates. See the intake section for the completeness rules.
 
+``sixta-review register`` is a second command, for the other end of a change:
+a pipeline, a migration tool's hook or a coding agent tells the same backend
+that a change ran on a database (``POST /api/v1/changes``), so SIXTA puts it on
+that database's timeline. Off unless ``SIXTA_CHANGE_URL`` +
+``SIXTA_CHANGE_TOKEN`` are set; it always exits zero. recipes/ holds the
+wiring for Flyway, Alembic, Django, Liquibase, plain SQL and coding agents.
+
 Stdlib only. Python >= 3.9.
 """
 
@@ -58,11 +65,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import NoReturn, Optional
 
 __version__ = "0.7.1"
@@ -2936,6 +2944,513 @@ def post_intake(opts: argparse.Namespace, findings: Optional[list[dict]]) -> Non
 
 
 # --------------------------------------------------------------------------
+# Registering a change (sixta_review.py register)
+# --------------------------------------------------------------------------
+#
+# A pipeline, a migration tool's hook or a coding agent tells the customer's
+# own SIXTA backend that a change ran on a database
+# (POST /api/v1/changes), so SIXTA puts it on that database's timeline and
+# watches what it did. recipes/ holds the per-tool wiring.
+#
+# Three rules, each enforced in register_main so no recipe can forget one:
+#
+#   * It never changes the caller's exit code. Whatever happens (nothing
+#     configured, a bad flag, an unreadable file, an unreachable backend, a
+#     timeout, any 3xx/4xx/5xx) the command exits zero: a migration that ran
+#     must not be failed by the note saying it ran.
+#   * It logs one line per invocation, built from fixed sentences and the
+#     names of the kit's own flags and the route's own fields. It never
+#     carries the token, a URL's credentials or query, statement text, the
+#     value of an argument, or any text from the backend's reply: a proxy
+#     that echoes the request back, or a shell that split a statement into
+#     arguments, must not put a customer's SQL in a CI log.
+#   * The bearer goes to the configured host only: redirects are not
+#     followed (urllib would otherwise replay the authorization header to
+#     wherever a 30x points).
+#
+# The body's field names, required fields and bounds are the route's own
+# (web/api/changeregister.go in sixta-backend). The route refuses a whole
+# request over a bound or carrying a field it does not have, so the bounds
+# are checked here before sending rather than learned by 400.
+REGISTER_MAX_STATEMENTS = 20             # statements per request
+REGISTER_MAX_STATEMENT_BYTES = 64 << 10  # one statement
+REGISTER_MAX_BODY_BYTES = 256 << 10      # one request
+REGISTER_MAX_CHANGE_IDS = 10
+REGISTER_MAX_IDENT_RUNES = 200           # the route's bounded, quote-free name
+REGISTER_MAX_REQUESTS = 10               # per change: beyond this its identity is sent, not its statements
+REGISTER_TIMEOUT_S = 10.0
+REGISTER_PLANES = ("schema", "statement", "instance", "configuration", "deploy")
+# Transaction control is not a change, and neither is a migration tool's own
+# bookkeeping (its history table); neither is sent.
+_REGISTER_TXN_RE = re.compile(
+    r"^\s*(?:BEGIN|COMMIT|ROLLBACK|END|START\s+TRANSACTION|SAVEPOINT|RELEASE\s+SAVEPOINT)\b[\w\s,]*$", re.I)
+_REGISTER_BOOKKEEPING_TABLES = frozenset(
+    ("flyway_schema_history", "databasechangelog", "databasechangeloglock", "alembic_version", "django_migrations"))
+# Strings and comments say nothing about what a statement changes: they are
+# blanked before a statement is read for its kind or its target table.
+_SQL_NOISE_RE = re.compile(r"'(?:[^']|'')*'|\$([A-Za-z_]*)\$.*?\$\1\$|--[^\n]*|/\*.*?\*/", re.S)
+_SQL_NAME = r"(?:[\w$]+|\"[^\"]+\"|`[^`]+`|\[[^\]]+\])"
+# The table a statement changes, where it is one of the forms a migration
+# tool keeps its own books with.
+_REGISTER_TARGET_RE = re.compile(
+    r"\s*(?:INSERT\s+(?:IGNORE\s+)?INTO|REPLACE\s+INTO|UPDATE(?:\s+ONLY)?|DELETE\s+FROM(?:\s+ONLY)?"
+    r"|TRUNCATE(?:\s+TABLE)?|LOCK\s+TABLES?"
+    r"|CREATE\s+(?:(?:GLOBAL\s+|LOCAL\s+)?TEMP(?:ORARY)?\s+|UNLOGGED\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?"
+    r"|ALTER\s+TABLE(?:\s+IF\s+EXISTS)?(?:\s+ONLY)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?"
+    r"|CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?" + _SQL_NAME + r"\s+ON(?:\s+ONLY)?"
+    r")\s+(" + _SQL_NAME + r"(?:\s*\.\s*" + _SQL_NAME + r")*)", re.I)
+# The route's own error codes, each with the fixed sentence the log line
+# says for it, and its field names. Nothing else from a reply is logged.
+_REGISTER_ERRORS = {
+    "unauthorized": "check SIXTA_CHANGE_TOKEN against the backend's SIXTA_CHANGE_TOKENS",
+    "intake_disabled": "SIXTA_CHANGE_TOKENS is not set on the backend, so it registers nothing",
+    "hidden_database": "the database is hidden in SIXTA",
+    "estate_unavailable": "the backend has not read its estate yet",
+    "bad_request": "the backend did not read the body as a registration",
+    "invalid_registration": "the backend refused a field",
+    "internal_error": "the backend failed to record it",
+}
+_REGISTER_FIELDS = frozenset((
+    "idempotency_key", "database", "plane", "subject", "before", "after", "statements", "parameters", "revision",
+    "at", "started_at", "finished_at", "duration", "actor", "tool", "pull_request", "change_ids", "release"))
+_REGISTER_SHOWN_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}")
+_RFC3339_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:[.,]\d+)?([Zz]|[+-]\d{2}:?\d{2})$")
+
+
+class _RegisterSkip(Exception):
+    """Nothing is sent, and the reason is the one line the command logs."""
+
+
+class _RegisterParser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error; this command never changes the
+    caller's exit code, so a bad flag is a reason like any other."""
+
+    def error(self, message: str) -> NoReturn:
+        # argparse's message quotes the offending value, which may be a
+        # statement a shell split into arguments: name the flag when it is
+        # one of the command's own, and never the value.
+        m = re.match(r"argument (--[a-z-]+)", message)
+        if m and m.group(1) in self._option_string_actions:
+            raise _RegisterSkip(f"bad arguments: {m.group(1)} was not given a value it takes")
+        raise _RegisterSkip("bad arguments: something was passed that register does not take (see register --help)")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # see the section comment: the bearer goes to the configured host only
+
+
+def register_endpoint(url: str) -> str:
+    """The register endpoint from the configured backend URL: the base URL of
+    the SIXTA backend, or the full endpoint pasted verbatim."""
+    u = url.rstrip("/")
+    if u.endswith("/api/v1/changes"):
+        return u
+    return u + "/api/v1/changes"
+
+
+def _register_ident(value: Optional[str]) -> Optional[str]:
+    """A value the route admits as a name (its admitIdent): trimmed, at most
+    200 characters, no quote, and no whitespace or control character other
+    than a plain space. None when it is not one."""
+    v = (value or "").strip()
+    if not v or len(v) > REGISTER_MAX_IDENT_RUNES or "'" in v or '"' in v:
+        return None
+    if any(ch != " " and (ch.isspace() or unicodedata.category(ch) == "Cc") for ch in v):
+        return None
+    return v
+
+
+def _register_instant(value: str, flag: str) -> str:
+    """An instant as the route reads it (RFC 3339, UTC, whole seconds) from
+    an RFC 3339 time with an offset or from epoch seconds."""
+    v = value.strip()
+    try:
+        if re.fullmatch(r"\d{9,11}(?:\.\d+)?", v):
+            moment = datetime.fromtimestamp(float(v), tz=timezone.utc)
+        else:
+            m = _RFC3339_RE.match(v)
+            if not m:
+                raise ValueError(v)
+            y, mo, d, h, mi, s = (int(g) for g in m.groups()[:6])
+            moment = datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc)
+            zone = m.group(7)
+            if zone not in ("Z", "z"):
+                minutes = int(zone[1:3]) * 60 + int(zone[-2:])
+                moment -= timedelta(minutes=minutes if zone[0] == "+" else -minutes)
+    except (ValueError, OverflowError, OSError):
+        raise _RegisterSkip(f"{flag} is not an RFC 3339 time with an offset (2026-01-31T10:00:00Z) or epoch seconds") from None
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _register_safe(text: object, token: str = "") -> str:
+    """Text fit for the one log line: a single line, bounded, and with the
+    token cut out should a server or proxy have echoed it back."""
+    s = " ".join(str(text).split())
+    if token:
+        s = s.replace(token, "[token]")
+    return s if len(s) <= 300 else s[:297] + "..."
+
+
+def _register_shown(database: str) -> str:
+    """The database's name for the log line when it is shaped like a name,
+    and "the database" when it is not: no argument's value is logged as
+    given."""
+    return database if _REGISTER_SHOWN_NAME_RE.fullmatch(database) else "the database"
+
+
+def _register_bookkeeping(bare: str) -> bool:
+    """Whether a statement (its strings and comments already blanked) changes
+    one of the migration tools' own tables. It is read from the table the
+    statement names as its target, never from a mention elsewhere in it: a
+    note or a comment that says alembic_version does not hide the change
+    beside it."""
+    m = _REGISTER_TARGET_RE.match(bare)
+    if not m:
+        return False
+    table = re.split(r"\s*\.\s*", m.group(1))[-1].strip('"`[]')
+    return table.lower() in _REGISTER_BOOKKEEPING_TABLES
+
+
+def _register_statements(texts: list[str]) -> tuple[list[str], int, int]:
+    """The statements worth registering from SQL texts: split, with
+    transaction control, tool bookkeeping and comment-only fragments left
+    out. Returns (statements, left out as not a change, left out as longer
+    than the route admits)."""
+    out: list[str] = []
+    not_a_change = oversized = 0
+    for text in texts:
+        for stmt in split_statements(text):
+            kw = _first_keyword(stmt)
+            if not kw:
+                continue  # a comment with no statement under it
+            bare = _SQL_NOISE_RE.sub(" ", stmt)
+            if _REGISTER_TXN_RE.match(bare) or _register_bookkeeping(bare):
+                not_a_change += 1
+            elif len(stmt.encode("utf-8", "replace")) > REGISTER_MAX_STATEMENT_BYTES:
+                oversized += 1
+            else:
+                out.append(stmt)
+    return out, not_a_change, oversized
+
+
+def _register_read(path: str) -> str:
+    try:
+        if path == "-":
+            return sys.stdin.buffer.read().decode("utf-8", "replace")
+        with open(path, "rb") as fh:
+            return fh.read().decode("utf-8", "replace")
+    except OSError as exc:
+        # The path is an argument's value, so it is not named.
+        raise _RegisterSkip(f"cannot read {'stdin' if path == '-' else 'a file given to --file'} ({type(exc).__name__})") from None
+
+
+def _register_key(change: dict, statements: list[str]) -> str:
+    """The idempotency key when the caller states none: the change's content
+    and the time it stated, so a retry of the same registration records
+    nothing twice and a later run of the same SQL at another stated time is
+    its own change."""
+    ident = [change.get(k) or "" for k in ("database", "plane", "tool", "revision", "subject", "started_at", "at")]
+    digest = hashlib.sha256(json.dumps([ident, statements]).encode()).hexdigest()
+    return f"sixta-ci-{digest[:32]}"
+
+
+def register_bodies(change: dict, statements: list[str]) -> tuple[list[dict], bool]:
+    """The request bodies for one change, in the route's field names. A
+    change with statements is one request while they fit the route's bounds
+    (20 statements, 256 KiB), several otherwise, each with its own
+    idempotency key; past REGISTER_MAX_REQUESTS only the change's identity
+    is sent. Returns (bodies, whether the statements were left out)."""
+    base = {k: v for k, v in change.items() if v not in (None, "", [])}
+    key = base.pop("idempotency_key", None) or _register_key(change, statements)
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for stmt in statements:
+        cost = len(json.dumps(stmt)) + 2
+        if current and (len(current) >= REGISTER_MAX_STATEMENTS or size + cost > REGISTER_MAX_BODY_BYTES - 8192):
+            chunks.append(current)
+            current, size = [], 0
+        current.append(stmt)
+        size += cost
+    if current:
+        chunks.append(current)
+    if len(chunks) > REGISTER_MAX_REQUESTS:
+        return [dict(base, idempotency_key=key)], True
+    if not chunks:
+        return [dict(base, idempotency_key=key)], False
+    if len(chunks) == 1:
+        return [dict(base, idempotency_key=key, statements=chunks[0])], False
+    if len(key) + len(f"/{len(chunks)}") > REGISTER_MAX_IDENT_RUNES:
+        # The suffix must fit the route's bound on a key: a key with no room
+        # for it is replaced by its digest, which a replay derives again.
+        key = "sixta-ci-" + hashlib.sha256(key.encode()).hexdigest()[:32]
+    return [dict(base, idempotency_key=f"{key}/{i + 1}", statements=chunk) for i, chunk in enumerate(chunks)], False
+
+
+def _register_post(endpoint: str, token: str, body: dict, timeout: float) -> tuple[bool, str]:
+    """One POST. Returns (recorded, what to say): on success whether the
+    backend wrote it or already had it; on failure the reason."""
+    req = urllib.request.Request(
+        endpoint, data=json.dumps(body).encode(), method="POST",
+        headers={"content-type": "application/json", "authorization": f"Bearer {token}", "user-agent": "sixta-ci"},
+    )
+    where = _redact_url(endpoint)
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as resp:
+            raw = resp.read(65536)
+    except urllib.error.HTTPError as exc:
+        # Of the reply, only the route's own error code and field name are
+        # read, each against a closed list, and each is said in the kit's
+        # words. Its text is never logged: a proxy may have put the request,
+        # statements and all, in it.
+        code = field = None
+        try:
+            err = json.loads(exc.read(65536).decode("utf-8", "replace"))
+            if isinstance(err, dict):
+                code, field = err.get("error"), err.get("field")
+        except Exception:  # noqa: BLE001 — an unreadable error body costs the detail, not the line
+            pass
+        said = _REGISTER_ERRORS.get(code, "") if isinstance(code, str) else ""
+        if said and isinstance(field, str) and field in _REGISTER_FIELDS:
+            said += f" ({field})"
+        if not said and exc.code == 401:
+            said = _REGISTER_ERRORS["unauthorized"]
+        elif 300 <= exc.code < 400:
+            said = "redirects are not followed, so the token goes to the configured host only"
+        return False, f"HTTP {exc.code} from {where}{': ' + said if said else ''}"
+    except Exception as exc:  # noqa: BLE001 — unreachable, timed out, TLS, anything: never the caller's problem
+        reason = getattr(exc, "reason", None)
+        timed_out = isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError) or "timed out" in str(exc)
+        what = f"no answer within {timeout:g}s" if timed_out else f"unreachable ({type(reason or exc).__name__})"
+        return False, f"{where} {what}"
+    try:
+        reply = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict) or not isinstance(reply.get("changes"), list):
+        return False, f"{where} answered, but not as the register route does; check SIXTA_CHANGE_URL"
+    return True, "duplicate" if reply.get("duplicate") is True else "recorded"
+
+
+def _flyway_changes(path: str, base: dict) -> tuple[list[tuple[dict, list[str]]], int]:
+    """One change per migration a ``flyway -outputType=json migrate`` run
+    applied: its script as the subject, its version as the revision, and its
+    statements where the result names a readable SQL file whose text is what
+    ran. A script with a ``${placeholder}`` is not that: the value Flyway
+    put there came from its command line, its environment or its own
+    configuration, none of which this command can see, and a guessed value
+    would register a change on a schema it never touched. Such a migration
+    is registered by its identity alone. Returns (changes, how many were)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        # The result is one JSON object; a notice Flyway printed around it
+        # (an upgrade hint, a licence line) is not part of it.
+        result = json.loads(text[text.index("{"):text.rindex("}") + 1])
+    except (OSError, ValueError) as exc:
+        raise _RegisterSkip(f"cannot read the file given to --flyway-json ({type(exc).__name__})") from None
+    migrations = result.get("migrations") if isinstance(result, dict) else None
+    if not isinstance(migrations, list):
+        raise _RegisterSkip("the file given to --flyway-json is not a flyway -outputType=json migrate result")
+    out: list[tuple[dict, list[str]]] = []
+    unresolved = 0
+    for m in migrations:
+        if not isinstance(m, dict):
+            continue
+        filepath = str(m.get("filepath") or "")
+        change = dict(base)
+        change["subject"] = base.get("subject") or _register_ident(os.path.basename(filepath)) \
+            or _register_ident(str(m.get("description") or "")) or "flyway migration"
+        change["revision"] = _register_ident(str(m.get("version") or "")) or base.get("revision")
+        texts: list[str] = []
+        if filepath.lower().endswith(".sql") and os.path.isfile(filepath):
+            sql = _register_read(filepath)
+            if "${" in sql:
+                unresolved += 1
+            else:
+                texts.append(sql)
+        out.append((change, texts))
+    return out, unresolved
+
+
+def build_register_parser() -> argparse.ArgumentParser:
+    p = _RegisterParser(
+        prog="sixta-review register",
+        description="Tell your SIXTA backend that a change ran on a database (POST /api/v1/changes). "
+                    "Off unless SIXTA_CHANGE_URL and SIXTA_CHANGE_TOKEN are set. Always exits zero.")
+    p.add_argument("--url", default=os.environ.get("SIXTA_CHANGE_URL") or None,
+                   help="base URL of your SIXTA backend (pairs with the SIXTA_CHANGE_TOKEN env secret; unset = off)")
+    p.add_argument("--database", default=os.environ.get("SIXTA_CHANGE_DATABASE") or None,
+                   help="the database the change ran on, by the name SIXTA knows it")
+    p.add_argument("--file", action="append", default=[], metavar="PATH",
+                   help="a SQL file that ran (repeatable; - reads stdin); its statements are sent")
+    p.add_argument("--statement", action="append", default=[], metavar="SQL",
+                   help="a statement that ran (repeatable)")
+    p.add_argument("--flyway-json", metavar="PATH",
+                   help="the result of `flyway -outputType=json migrate`: one change per migration it applied")
+    p.add_argument("--subject", help="what changed, when no statement says it (a migration's name, an index)")
+    p.add_argument("--plane", default="schema", choices=REGISTER_PLANES,
+                   help="the kind of change (default schema; statements are schema or statement)")
+    p.add_argument("--tool", help="the tool that ran it (flyway, alembic, django, liquibase, psql, an agent's name)")
+    p.add_argument("--revision", help="the migration version or the commit the change came from")
+    p.add_argument("--actor", help="who made the change, as a claim; SIXTA names the token as the poster either way")
+    p.add_argument("--pull-request", help="the pull request the change came from, e.g. owner/repo#12")
+    p.add_argument("--change-id", action="append", default=[], type=int, metavar="N",
+                   help="a SIXTA change id this run applied (repeatable, at most 10)")
+    p.add_argument("--started-at", metavar="TIME", help="when it started: RFC 3339 with an offset, or epoch seconds")
+    p.add_argument("--finished-at", metavar="TIME", help="when it finished")
+    p.add_argument("--at", metavar="TIME", help="the instant it ran, when no span is known")
+    p.add_argument("--idempotency-key", help="a replay with the same key records nothing twice "
+                                             "(default: derived from the change's content and stated time)")
+    p.add_argument("--timeout", type=float, default=None, metavar="SECONDS",
+                   help=f"how long to wait for the backend (default {REGISTER_TIMEOUT_S:g}, or SIXTA_CHANGE_TIMEOUT)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the request bodies that would be sent, and send nothing")
+    return p
+
+
+def _register(argv: list[str], token: str) -> str:
+    """Build and post the registration; returns the line to log. Raises
+    _RegisterSkip with the reason when nothing is (or can be) sent."""
+    try:
+        opts = build_register_parser().parse_args(argv)
+    except _RegisterSkip:
+        if not token and not os.environ.get("SIXTA_CHANGE_URL"):
+            return ""  # not configured here: a bad flag is not worth a line either
+        raise
+    if not opts.dry_run:
+        if not opts.url and not token:
+            return ""  # off unless configured, and silent about it
+        if not opts.url or not token:
+            raise _RegisterSkip("SIXTA_CHANGE_URL and SIXTA_CHANGE_TOKEN must both be set")
+    database = (opts.database or "").strip()
+    if not database:
+        raise _RegisterSkip("no database named (--database or SIXTA_CHANGE_DATABASE)")
+    timeout = opts.timeout
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("SIXTA_CHANGE_TIMEOUT") or REGISTER_TIMEOUT_S)
+        except ValueError:
+            timeout = REGISTER_TIMEOUT_S
+    timeout = min(max(timeout, 0.1), 120.0)
+
+    shown = _register_shown(database)
+    notes: list[str] = []
+    base: dict = {"database": database, "plane": opts.plane}
+    for name in ("subject", "tool", "revision", "actor", "pull_request", "idempotency_key"):
+        raw = getattr(opts, name)
+        if raw is None or not raw.strip():
+            continue
+        value = _register_ident(raw)
+        if value is None:
+            if name == "idempotency_key":
+                raise _RegisterSkip("--idempotency-key is not a plain name (at most 200 characters, no quotes or line breaks)")
+            notes.append(f"{name} left out as not a plain name")
+        else:
+            base[name] = value
+    if opts.change_id:
+        ids = [i for i in dict.fromkeys(opts.change_id) if i > 0]
+        if len(ids) != len(set(opts.change_id)) or len(ids) > REGISTER_MAX_CHANGE_IDS:
+            notes.append("change ids left out: they are positive numbers, at most 10")
+        else:
+            base["change_ids"] = ids
+    if opts.at and (opts.started_at or opts.finished_at):
+        raise _RegisterSkip("state --at, or --started-at with --finished-at, not both")
+    if opts.at:
+        base["at"] = _register_instant(opts.at, "--at")
+    elif opts.started_at:
+        base["started_at"] = _register_instant(opts.started_at, "--started-at")
+        if opts.finished_at:
+            base["finished_at"] = _register_instant(opts.finished_at, "--finished-at")
+    elif opts.finished_at:
+        base["at"] = _register_instant(opts.finished_at, "--finished-at")  # an end with no start is an instant
+
+    texts = [_register_read(p) for p in opts.file] + list(opts.statement)
+    if opts.flyway_json:
+        if texts:
+            raise _RegisterSkip("--flyway-json names its own files; --file and --statement are not sent beside it")
+        base.pop("idempotency_key", None)  # one key cannot name several migrations
+        changes, unresolved = _flyway_changes(opts.flyway_json, base)
+        if not changes:
+            return f"register: the Flyway run applied no migration, so there is nothing to register on {shown}"
+        if unresolved:
+            notes.append(f"{unresolved} migration(s) with Flyway placeholders registered by identity, their resolved text unknown here")
+    else:
+        changes = [(base, texts)]
+
+    requests: list[dict] = []
+    dropped = oversized = 0
+    for change, change_texts in changes:
+        statements, d, o = _register_statements(change_texts)
+        dropped, oversized = dropped + d, oversized + o
+        if statements and change["plane"] not in ("schema", "statement"):
+            raise _RegisterSkip(f"statements are on the schema or statement plane, not {change['plane']}")
+        if not statements and not change.get("subject"):
+            if not (change["plane"] == "deploy" and change.get("revision")):
+                # Not a failure: a tool that found nothing to apply ran no
+                # change (a Liquibase update with nothing pending, say).
+                left = f" ({d} transaction-control or tool-bookkeeping statement(s) are not one)" if d else ""
+                return f"register: nothing to register on {shown}: no statement that is a change ran{left}, and no --subject names one"
+        bodies, withheld = register_bodies(change, statements)
+        if withheld:
+            # Too many statements to send: the change is still registered,
+            # by its identity, and the route asks an identity for a subject.
+            if not bodies[0].get("subject"):
+                bodies[0]["subject"] = bodies[0].get("revision") or f"{bodies[0].get('tool') or 'migration'} run"
+            notes.append(f"{len(statements)} statements left out as too many to send")
+        requests.extend(bodies)
+    if dropped:
+        notes.append(f"{dropped} transaction-control or tool-bookkeeping statement(s) not sent")
+    if oversized:
+        notes.append(f"{oversized} statement(s) over {REGISTER_MAX_STATEMENT_BYTES >> 10} KiB not sent")
+    tail = "".join(f"; {n}" for n in notes)
+
+    if opts.dry_run:
+        print(json.dumps(requests, indent=2))
+        return f"register: dry run, nothing sent; {len(requests)} request(s) printed{tail}"
+
+    endpoint = register_endpoint(opts.url)
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise _RegisterSkip("SIXTA_CHANGE_URL is not an http(s) URL")
+    if parsed.scheme != "https" and parsed.hostname.lower() not in ("localhost", "127.0.0.1", "::1"):
+        # Said, not refused: SIXTA backends do run on plain HTTP inside
+        # private networks (the intake post takes the same line).
+        tail += "; the URL is not https, so the token and statements travel unencrypted"
+    duplicates = 0
+    for i, body in enumerate(requests):
+        ok, said = _register_post(endpoint, token, body, timeout)
+        if not ok:
+            sent = f"; {i} of {len(requests)} request(s) were posted before it" if i else ""
+            raise _RegisterSkip(f"{said}{sent}{tail}")
+        duplicates += said == "duplicate"
+    statements_sent = sum(len(b.get("statements") or []) for b in requests)
+    what = f"{len(changes)} change(s)" if len(changes) > 1 else "the change"
+    counts = f"{statements_sent} statement(s) in {len(requests)} request(s)" if statements_sent else "by its identity, no statement text"
+    already = f"; {duplicates} request(s) were already recorded under the same key" if duplicates else ""
+    return f"register: SIXTA recorded {what} on {shown}: {counts}{already}{tail}"
+
+
+def register_main(argv: list[str]) -> int:
+    """``sixta_review.py register``: always returns zero and logs at most one
+    line (see the section comment)."""
+    token = (os.environ.get("SIXTA_CHANGE_TOKEN") or "").strip()
+    try:
+        line = _register(argv, token)
+        if line:
+            info(_register_safe(line, token))
+    except _RegisterSkip as exc:
+        warn(_register_safe(f"register: not registered, and the change itself is unaffected: {exc}", token))
+    except SystemExit:
+        pass  # --help printed its text
+    except Exception as exc:  # noqa: BLE001 — nothing here may fail the caller
+        warn(f"register: not registered, and the change itself is unaffected: {type(exc).__name__}")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -3048,6 +3563,11 @@ def _auth_failed(opts: argparse.Namespace, exc: SixtaAuthError) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args and args[0] == "register":
+        # Its own command with its own rules (it never gates): see the
+        # "Registering a change" section.
+        return register_main(args[1:])
     opts = build_parser().parse_args(argv)
     opts.platform = detect_platform(opts.platform)
     # Resolve the API mode: explicit flag > SIXTA_API env > platform default

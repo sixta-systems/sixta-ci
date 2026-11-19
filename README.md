@@ -349,6 +349,141 @@ does not refuse — SIXTA backends do run on plain HTTP inside private
 networks) when the token and findings would travel unencrypted beyond
 loopback.
 
+## Telling SIXTA a change ran (`register`)
+
+The review above looks at a change before it merges. `register` is the other
+end: when a migration actually runs, the pipeline, the migration tool's own
+hook or a coding agent tells your
+[SIXTA backend](https://github.com/fortxun/sixta-backend), and SIXTA puts the
+change on that database's timeline and watches what it did. The migration
+tool is the most precise witness there is: it knows the statements, the
+database and the moment.
+
+```bash
+python3 sixta_review.py register \
+  --database orders-main --tool flyway --revision 7 \
+  --file db/migration/V7__add_orders_index.sql \
+  --started-at 2026-11-17T10:00:00Z --finished-at 2026-11-17T10:00:42Z
+```
+
+It posts one change to `POST /api/v1/changes` on your backend and prints one
+line saying what happened. `register` is in releases after `v0.8.0`.
+
+### Configuring it
+
+Two values, both from the environment of the step that runs the migration.
+With neither set the command does nothing and prints nothing, so a recipe is
+safe to leave in place in every environment.
+
+- `SIXTA_CHANGE_URL` (or `--url`): the base URL of your SIXTA backend, e.g.
+  `https://sixta.internal.example.com`.
+- `SIXTA_CHANGE_TOKEN` (env secret, never a flag): the secret half of one
+  `name:secret` pair in the backend's `SIXTA_CHANGE_TOKENS` setting. The
+  pair's name is who SIXTA says posted the change ("Posted to SIXTA by
+  migrations"), so give each pipeline or tool its own pair.
+
+And what the change is:
+
+| Flag | Notes |
+|---|---|
+| `--database` (or `SIXTA_CHANGE_DATABASE`) | Required. The database's name as SIXTA knows it. |
+| `--file PATH` / `--statement SQL` | The SQL that ran. Repeatable; `--file -` reads stdin. |
+| `--subject` | What changed, when no statement says it (a migration's name). Required when there are no statements. |
+| `--tool`, `--revision`, `--actor`, `--pull-request`, `--change-id` | Optional context: the tool, the migration version or commit, who made the change (kept as a claim beside the token's name), `owner/repo#12`, the backend's change ids (positive numbers, at most 10). |
+| `--started-at` / `--finished-at`, or `--at` | When it ran: RFC 3339 with an offset, or epoch seconds. With none stated, SIXTA dates the change at the post's arrival. The backend refuses a time more than five minutes ahead of its clock or more than 30 days old. |
+| `--plane` | `schema` (default), `statement`, `instance`, `configuration` or `deploy`. Statements go on `schema` or `statement`. |
+| `--idempotency-key` | A replay with the same key records nothing twice. Default: derived from the change's content and its stated time. |
+| `--flyway-json PATH` | The result of `flyway -outputType=json migrate`: one change per migration it applied. |
+| `--timeout` (or `SIXTA_CHANGE_TIMEOUT`) | Seconds to wait for the backend, default 10. |
+| `--dry-run` | Print the exact request bodies and send nothing. Needs no URL or token. |
+
+### It cannot fail your deploy
+
+`register` always exits zero and prints one line. An unreachable backend, a
+timeout, a 4xx or 5xx, a redirect, a bad flag, an unreadable file: each is one
+`WARNING` line saying the change was not registered, and the migration that
+ran is unaffected. It makes one attempt and does not retry. The line is built
+from fixed sentences and the names of the command's own flags and the route's
+own fields: it never carries the token, credentials or query strings from the
+URL, statement text, the value of an argument, or any text from the backend's
+reply (so a proxy that echoes the request back cannot put your SQL in a CI
+log). The backend's answers, for reference: `201` recorded, `200` already
+recorded under that key, `400` naming the field it refused, `401` wrong
+token, `404` `SIXTA_CHANGE_TOKENS` is not set on the backend, `409` the
+database is hidden in SIXTA, `503` the backend has not read its estate yet.
+
+Registering asks nothing and approves nothing. SIXTA records the change as a
+claim posted by that token until one of its own reads confirms it.
+
+### Recipes
+
+Each file under [`recipes/`](recipes/) wires one tool to the command; its
+header says where it goes.
+
+| You run migrations with | Recipe | It registers |
+|---|---|---|
+| Flyway inside a JVM service (Spring Boot) | [`recipes/flyway/SixtaRegisterCallback.java`](recipes/flyway/SixtaRegisterCallback.java) | One change per migration: `afterEachMigrate` notes it, `afterMigrate` posts it, so nothing is posted inside a migration's transaction. Needs Python 3.9+ and `sixta_review.py` in the image. |
+| The Flyway command line | [`recipes/flyway/flyway-migrate.sh`](recipes/flyway/flyway-migrate.sh) | One change per migration the run applied, from Flyway's JSON result. A script with a `${placeholder}` is registered by name and version only: the wrapper reads the file and cannot see the value Flyway put there. The callback above is handed the resolved statement. |
+| Alembic | [`recipes/alembic/env_hook.py`](recipes/alembic/env_hook.py) | One change per `alembic upgrade` that moved the revision: a hook around `run_migrations` in `env.py`. |
+| Django | [`recipes/django/sixta_register.py`](recipes/django/sixta_register.py) | One change per `migrate` run that applied something: a `post_migrate` receiver. [`sixta_migrate.py`](recipes/django/sixta_migrate.py) is the management-command wrapper for projects that prefer not to add a receiver: it connects the receiver for its own run and disconnects it when the run ends. |
+| Liquibase | [`recipes/liquibase/liquibase-update.sh`](recipes/liquibase/liquibase-update.sh) | One change per `liquibase update` that applied something. |
+| `psql` / `mysql` in a pipeline step | [`recipes/sql/run-sql.sh`](recipes/sql/run-sql.sh) | The SQL file the step ran, timed around the step. |
+| A coding agent | [`recipes/agent/AGENTS.md`](recipes/agent/AGENTS.md) | What the agent applied, as its next step. |
+
+A pipeline step, by hand:
+
+```yaml
+- name: Apply the change
+  env:
+    SIXTA_CHANGE_URL: ${{ vars.SIXTA_CHANGE_URL }}
+    SIXTA_CHANGE_TOKEN: ${{ secrets.SIXTA_CHANGE_TOKEN }}
+    SIXTA_CHANGE_DATABASE: orders-main
+  run: |
+    curl -fsSL "https://raw.githubusercontent.com/sixta-systems/sixta-ci/<tag>/sixta_review.py" -o sixta_review.py
+    # run-sql.sh: copied into your repository from recipes/sql/
+    ci/run-sql.sh db/changes/add-index.sql \
+      psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/changes/add-index.sql
+```
+
+### What leaves the pipeline
+
+One HTTPS request per change (several for a migration of more than 20
+statements) to **your own SIXTA backend**, the URL you configured, with the
+token in the `Authorization` header. Nothing goes to `connect.sixta.ai`, and
+the command writes nothing to disk (the shell recipes keep the tool's own
+output in a temporary file for the length of the step). `--dry-run` prints
+the exact body.
+
+The body carries only these fields, and only the ones you passed:
+
+- `database`, `plane`, and an `idempotency_key`.
+- `statements`: the text of each statement that ran, as the tool rendered it,
+  literals and comments included. The backend tokenizes each statement at the
+  door (literal values are replaced) before anything is stored, and stores no
+  literal SQL; a statement it cannot tokenize safely is kept only as its
+  leading verb.
+- `subject`, `tool`, `revision`, `actor`, `pull_request`, `change_ids`.
+- `started_at` and `finished_at`, or `at`.
+
+What is never sent: the token to any host but the configured one (redirects
+are not followed), database credentials or connection URLs, bind-parameter
+values (the Alembic hook reads statement text only), rows or query results,
+environment variables, and file paths (a file's base name is used as the
+subject, nothing more). Three kinds of statement are left out: transaction
+control (`BEGIN`, `COMMIT`), a statement that changes the migration tool's
+own bookkeeping table (`flyway_schema_history`, `DATABASECHANGELOG`,
+`alembic_version`, `django_migrations`; a statement that only mentions one in
+a comment or a string is sent), and any single statement over 64 KiB. Two
+kinds of migration are registered by name and version, without statement
+text: one of more than 200 statements, and, with `--flyway-json`, one whose
+script has a Flyway `${placeholder}`, because the text that ran is not in the
+file and a guessed value would put the change on a schema it never touched.
+The line the command prints says when any of these happened.
+
+Use an `https` URL: as with the intake post, the command says so (and does
+not refuse) when the token and statements would travel unencrypted beyond
+loopback.
+
 ## Inputs
 
 Shared across both platforms (GitLab job inputs / GitHub Action `with:`):
@@ -436,6 +571,12 @@ XML leaf behind a master index.
 pip install -e ".[dev]"
 pytest            # unit + stub-server integration tests (GitLab + GitHub), no network
 ```
+
+`tests/test_recipes.py` runs each recipe with its real tool (Django, Alembic,
+Flyway, Liquibase, `sqlite3`) against a local stand-in for the register route
+and a scratch SQLite file, and skips a tool that is not installed.
+`pip install -e ".[dev,recipes]"` adds Django and Alembic; CI's `recipes` job
+also installs the Flyway command line.
 
 Both wrappers fetch `sixta_review.py` (stdlib-only, single file) from this repo
 at `script_ref`. Releases are git tags; the template + action defaults pin them.

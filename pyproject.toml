@@ -15,6 +15,8 @@ dependencies = []
 [project.optional-dependencies]
 yaml = ["PyYAML>=6"]
 dev = ["pytest>=8"]
+# The tools tests/test_recipes.py runs the recipes with (it skips what is absent).
+recipes = ["Django>=4.2", "alembic>=1.13"]
 
 [project.scripts]
 sixta-review = "sixta_review:main"
